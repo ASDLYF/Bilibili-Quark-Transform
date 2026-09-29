@@ -1,0 +1,4 @@
+{
+  "title": "Bilibili Quark Transform",
+  "description": "Batch-download a Bilibili uploader's videos (choosable resolution and part) and upload them to Quark Drive. Verifies each file's size against the Bilibili source, with resume and concurrency."
+}

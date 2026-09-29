@@ -1,0 +1,40 @@
+# 凭据文件（绝不上传）
+bili_cookie.txt
+quark_cookie.txt
+**/bili_cookie.txt
+**/quark_cookie.txt
+
+# 工作目录（进度、日志、下载中转）
+_bili_quark_work/
+**/_bili_quark_work/
+downloads/
+_tmp/
+
+# 运行时产物
+*.log
+_logs/
+_result-*.json
+progress.json
+session.json
+state.jsonl
+remote_index.json
+video_list.json
+config.json
+_pyprobe.log
+
+# 部署打包产物
+dist/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.pyc
+__pycache__/
+
+# Node
+node_modules/

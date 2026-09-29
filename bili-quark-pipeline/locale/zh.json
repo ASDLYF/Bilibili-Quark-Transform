@@ -1,0 +1,4 @@
+{
+  "title": "Bilibili Quark Transform",
+  "description": "把 B 站 UP 主的投稿批量下载（可选分辨率、可选分集）并上传到夸克网盘；支持与 B 站源逐个核对文件大小、断点续跑与并发。"
+}

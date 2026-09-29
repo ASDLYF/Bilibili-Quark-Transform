@@ -1,0 +1,13 @@
+- insert:
+    - id: bili-quark-pipeline
+      name: 'bili-quark-pipeline'
+      config:
+        scriptDir: '/Users/yufanli/DSH_workspace/bili-quark-plugin-1.1.0/bili_quark_backend'
+        workRoot: ''
+        pythonPath: ''
+        ffmpegPath: ''
+        ffprobePath: ''
+        diskMinGb: 12
+        startGraceMs: 2500
+        backendTimeoutMs: 1200000
+        maxLogTail: 6000

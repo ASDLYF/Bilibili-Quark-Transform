@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Bilibili Quark Transform">
+  <defs>
+    <!-- 左上取 B 站蓝、右下取夸克网盘的蓝紫，做成一次「搬运」的过渡 -->
+    <linearGradient id="bq" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#00A1D6"/>
+      <stop offset="0.55" stop-color="#1A6DFF"/>
+      <stop offset="1" stop-color="#6E5BFF"/>
+    </linearGradient>
+    <linearGradient id="bqSheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="64" height="64" rx="14" fill="url(#bq)"/>
+  <rect x="0" y="0" width="64" height="64" rx="14" fill="url(#bqSheen)"/>
+
+  <!-- B 站那台小电视：圆角机身 + 两根天线 + 播放三角 -->
+  <path d="M21 7l6 6M43 7l-6 6" fill="none" stroke="#ffffff" stroke-width="3"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="12" y="13" width="40" height="25" rx="7" fill="none"
+        stroke="#ffffff" stroke-width="3"/>
+  <path d="M28.5 21.5L37 25.5L28.5 29.5Z" fill="#ffffff"/>
+
+  <!-- 夸克的云（网盘）：电视落进云里，表示「搬到网盘」 -->
+  <g fill="#ffffff">
+    <circle cx="26" cy="47" r="6"/>
+    <circle cx="36" cy="45" r="7.5"/>
+    <circle cx="43" cy="50" r="5"/>
+    <rect x="24" y="48" width="20" height="7" rx="3.5"/>
+  </g>
+</svg>
