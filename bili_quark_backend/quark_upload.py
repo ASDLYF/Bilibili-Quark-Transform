@@ -293,6 +293,38 @@ class Quark:
                     return it
         return None
 
+    # --- 删除
+    def delete(self, fids, log=None):
+        """删除一个或多个文件/文件夹（移入回收站）。
+
+        fids: str 或 list[str]，要删除的 fid。
+        返回 task_id；删除是异步操作，可用 wait_task() 等待完成。
+        """
+        if isinstance(fids, str):
+            fids = [fids]
+        d = self.api('POST', '/1/clouddrive/file/delete', payload={
+            'action_type': 2, 'filelist': fids, 'exclude_fids': []})
+        r = self._ok(d)
+        task_id = (r.get('data') or {}).get('task_id')
+        if log:
+            log('已提交删除 %d 个文件 task_id=%s' % (len(fids), task_id))
+        return task_id
+
+    def wait_task(self, task_id, timeout=60, interval=0.5, log=None):
+        """轮询异步任务直到完成或超时。返回最终 status（2=完成, 3=失败）。"""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            d = self.api('GET', '/1/clouddrive/task', params={'task_id': task_id})
+            status = (d.get('data') or {}).get('status')
+            if status in (2, 3):
+                if log:
+                    log('任务 %s 结束 status=%s' % (task_id[:12], status))
+                return status
+            time.sleep(interval)
+        if log:
+            log('任务 %s 超时 %.0fs' % (task_id[:12], timeout))
+        return None
+
     # --- 上传
     def upload(self, path, pdir_fid, name=None, concurrency=4, log=print, on_progress=None):
         """上传一个文件到指定目录。

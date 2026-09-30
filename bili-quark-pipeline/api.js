@@ -533,7 +533,7 @@ export function registerPanelRoutes(ctx, deps) {
       if (body === null) return { status: 400, json: { ok: false, error: '请求体不是合法 JSON' } };
       const action = String((body && body.action) || '');
       const mid = body && body.mid ? String(body.mid) : '';
-      const needsMid = ['targets', 'verify', 'runDry', 'run', 'stop', 'fetchList', 'saveDir', 'addUp', 'checkSrc'];
+      const needsMid = ['targets', 'verify', 'runDry', 'run', 'stop', 'fetchList', 'saveDir', 'addUp', 'checkSrc', 'repair'];
       if (!mid && needsMid.includes(action)) {
         return { status: 400, json: { ok: false, error: '缺少 mid（B 站 UID）' } };
       }
@@ -580,6 +580,14 @@ export function registerPanelRoutes(ctx, deps) {
             page: body.page ? Number(body.page) : undefined,
             maxHeight: body.maxHeight ? Number(body.maxHeight) : undefined,
             tolerance: body.tolerance != null ? Number(body.tolerance) : undefined,
+          });
+          break;
+        case 'repair':
+          // 修复大小不符条目：删除夸克端文件 + 重置 state，返回待重跑 BV 列表
+          result = await callTool('bili_quark_repair', {
+            mid,
+            only: Array.isArray(body.only) && body.only.length ? body.only.map(String) : undefined,
+            quarkDir: body.quarkDir ? String(body.quarkDir) : undefined,
           });
           break;
         case 'checkCred':

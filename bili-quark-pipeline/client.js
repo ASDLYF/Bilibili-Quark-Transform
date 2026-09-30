@@ -491,6 +491,8 @@ window.__ModuleLoader__.load({
         }
       }); // 0 = 最高画质
       const [checkMsg, setCheckMsg] = React.useState('');   // 「与B站核对」结果
+      const [repairTargets, setRepairTargets] = React.useState([]); // checkSrc 返回的大小不符条目（bvid 列表）
+      const [repairBusy, setRepairBusy] = React.useState(false);
       const [credInfo, setCredInfo] = React.useState(null); // 凭据检测结果
       const [credBusy, setCredBusy] = React.useState(false);
 
@@ -729,6 +731,9 @@ window.__ModuleLoader__.load({
         const d = (r && r.data) || {};
         if (r && r.ok) {
           const bad = (d.items || []).filter((x) => x && x.ok === false);
+          // 只把「大小不符」的条目作为修复目标（missing/error 不走修复流程）
+          const sizeBad = bad.filter((x) => x.status === 'size');
+          setRepairTargets(sizeBad.map((x) => x.bvid));
           setCheckMsg(
             `与B站核对完成：共 ${d.checked ?? 0} 条，一致 ${d.okCount ?? 0}，` +
               `大小不符 ${d.sizeMismatch ?? 0}，网盘缺失 ${d.missing ?? 0}，取流失败 ${d.failed ?? 0}` +
@@ -749,8 +754,41 @@ window.__ModuleLoader__.load({
                 : '。'),
           );
         } else {
+          setRepairTargets([]);
           setCheckMsg('核对失败：' + String((r && r.error) || '未知错误').slice(0, 300));
         }
+      };
+
+      /** 修复大小不符条目：删除夸克端文件 → 重置 state → 自动重传 */
+      const doRepair = async () => {
+        if (!active || !repairTargets.length) return;
+        setRepairBusy(true);
+        setCheckMsg(`正在修复 ${repairTargets.length} 条大小不符的视频…（删除远端文件 + 重置状态）`);
+        const r = await act('repair', { mid: active.mid, only: repairTargets });
+        if (r && r.ok) {
+          const d = r.data || {};
+          setCheckMsg(
+            `修复完成：删除 ${d.deleted ?? 0} 个远端文件，重置 ${(d.resetBvids || []).length} 条状态。正在启动重传…`,
+          );
+          // 自动触发重传
+          const runR = await act('run', {
+            mid: active.mid,
+            only: d.resetBvids || repairTargets,
+            force: true,
+            maxHeight: quality || undefined,
+          });
+          setCheckMsg(
+            runR && runR.ok
+              ? `已启动重传 ${(d.resetBvids || repairTargets).length} 条（force 模式）`
+              : '重传启动失败：' + String((runR && runR.error) || '未知错误').slice(0, 200),
+          );
+          setRepairTargets([]);
+          await reload();
+          await loadVideos();
+        } else {
+          setCheckMsg('修复失败：' + String((r && r.error) || '未知错误').slice(0, 300));
+        }
+        setRepairBusy(false);
       };
 
       /** 凭据有效性检测（B 站 nav + 夸克 member，顺带回过期时间） */
@@ -865,7 +903,15 @@ window.__ModuleLoader__.load({
             : null,
           // 与 B 站源头核对大小（拿 CDN 真实字节数，不下载）
           active
-            ? button(T.checkSrc, doCheckSrc, busy ? { opacity: 0.6 } : null)
+            ? button(T.checkSrc, doCheckSrc, busy || repairBusy ? { opacity: 0.6 } : null)
+            : null,
+          // 修复大小不符条目（删除远端 + 重置 state + 重传）
+          active && repairTargets.length
+            ? button(
+                repairBusy ? '修复中…' : `修复 ${repairTargets.length} 条`,
+                doRepair,
+                busy || repairBusy ? { opacity: 0.6 } : S.btnDanger,
+              )
             : null,
           // 处理整个待处理队列（不勾选时的批量方式）
           active && !active.alive && active.state !== 'running'

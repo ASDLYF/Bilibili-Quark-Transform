@@ -41,7 +41,7 @@ EXIT_ARGS = 1
 EXIT_FAILED = 2
 
 COMMAND_NAMES = ('fetch', 'set-dir', 'resolve-dir', 'status', 'list', 'run', 'verify',
-                 'check-src', 'check-cred')
+                 'check-src', 'check-cred', 'repair')
 
 
 # ---------------------------------------------------------------- 输出/日志
@@ -66,10 +66,16 @@ _LOG_LOCK = threading.Lock()
 
 
 class Logger:
-    """日志一律走 stderr + <workdir>/run.log，绝不污染 stdout。"""
+    """日志只走 stderr，绝不污染 stdout。
+
+    注意：不再自行写入 run.log。JS 宿主已通过 fd 重定向把子进程的 stderr
+    捕获到 run.log，如果这里再 open(run.log, 'a') 写一次，每条日志就会
+    出现两遍，导致前端进度条在两个计数之间来回跳。
+    """
 
     def __init__(self, logfile=None):
-        self.logfile = logfile
+        # logfile 参数保留以兼容旧调用方，但不再使用
+        self.logfile = None
 
     def __call__(self, msg, *a):
         if a:
@@ -82,13 +88,6 @@ class Logger:
                 sys.stderr.flush()
             except Exception:
                 pass
-            if self.logfile:
-                try:
-                    os.makedirs(os.path.dirname(self.logfile), exist_ok=True)
-                    with open(self.logfile, 'a', encoding='utf-8') as f:
-                        f.write(line + '\n')
-                except Exception:
-                    pass
 
 
 def out_json(obj, json_out=None):
@@ -1298,6 +1297,128 @@ def cmd_check_cred(args):
     return EXIT_OK
 
 
+# ---------------------------------------------------------------- repair
+
+def cmd_repair(args):
+    """修复大小不符的条目：删除夸克端文件 → 重置 state → 输出待重跑 BV 列表。
+
+    前端拿到返回的 bvids 后，再调 run --only <bvids> --force 重新下载上传。
+    """
+    workdir = os.path.abspath(args.workdir or core.default_project_dir())
+    layout = core.Layout(workdir, args.video_list, args.state_file)
+    log = Logger(layout.runlog)
+
+    # 1. 加载清单
+    if not os.path.exists(layout.video_list):
+        return die('清单不存在：%s（先跑 fetch --mid <MID>）' % layout.video_list, log=log)
+    try:
+        vl = json.loads(open(layout.video_list, encoding='utf-8').read())
+    except Exception as e:
+        return die(str(e), log=log)
+
+    mid = args.mid or vl.get('mid')
+    if not mid:
+        return die('repair 必须给 --mid <MID>', log=log)
+
+    # 2. 解析夸克目录
+    quark_fid = args.quark_dir
+    if not quark_fid:
+        try:
+            cfg = json.loads(open(layout.config, encoding='utf-8').read())
+            quark_fid = cfg.get('quark_dir_fid')
+        except Exception:
+            pass
+    if not quark_fid:
+        return die('未设定夸克目标目录，先跑 set-dir --fid <FID>', log=log)
+
+    # 3. 确定要修复的 BV 号
+    only_raw = []
+    for chunk in (args.only or []):
+        for bv in chunk.split(','):
+            bv = bv.strip()
+            if bv:
+                only_raw.append(bv)
+    only_bvids = [x.split(':')[0] for x in only_raw]
+    if not only_bvids:
+        return die('repair 必须给 --only <BV号>（至少一个）', log=log)
+
+    # 4. 获取远端文件列表，找到对应 fid
+    cookie_q = credentials.load_quark(workdir)
+    q = Quark(cookie_q)
+    remote = {}
+    try:
+        for f in q.list_all(quark_fid):
+            name = f.get('file_name') or ''
+            if name:
+                remote[name] = f
+    except Exception as e:
+        return die('获取远端文件列表失败：%s' % e, log=log)
+
+    # 5. 匹配文件名 → 收集要删除的 fid
+    targets = {t['bvid']: t for t in vl.get('videos', [])}
+    to_delete_fids = []
+    to_delete_names = []
+    not_found = []
+    for bvid in only_bvids:
+        t = targets.get(bvid)
+        if not t:
+            not_found.append(bvid)
+            continue
+        page = int(t.get('page') or 1)
+        base = core.safe_filename(t.get('title') or bvid)
+        suffix = '' if page <= 1 else ' [P%d]' % page
+        fname = '%s%s.mp4' % (base, suffix)
+        hit = remote.get(fname)
+        if hit:
+            to_delete_fids.append(hit['fid'])
+            to_delete_names.append(fname)
+            log('找到远端文件 %s fid=%s' % (fname[:60], hit['fid'][:12]))
+        else:
+            not_found.append(bvid)
+            log('远端未找到 %s（%s），跳过删除' % (bvid, fname[:60]))
+
+    # 6. 批量删除
+    deleted_count = 0
+    delete_task_id = None
+    if to_delete_fids:
+        try:
+            delete_task_id = q.delete(to_delete_fids, log=log)
+            status = q.wait_task(delete_task_id, timeout=120, log=log)
+            if status == 2:
+                deleted_count = len(to_delete_fids)
+                log('删除完成 %d 个文件' % deleted_count)
+            else:
+                log('删除任务异常 status=%s，继续重置 state' % status)
+        except Exception as e:
+            log('删除失败：%s，继续重置 state' % e)
+
+    # 7. 重置 state：为每个 bvid 追加一条 pending 记录（last-write-wins）
+    state_writer = core.StateWriter(layout.state)
+    reset_bvids = []
+    for bvid in only_bvids:
+        t = targets.get(bvid)
+        title = t.get('title') if t else ''
+        state_writer.append({
+            'bvid': bvid,
+            'title': title,
+            'status': 'pending',
+            'repaired_at': core.now_str(),
+        })
+        reset_bvids.append(bvid)
+        log('已重置 state %s → pending' % bvid)
+
+    out_json({
+        'ok': True,
+        'deleted': deleted_count,
+        'delete_task_id': delete_task_id,
+        'reset_bvids': reset_bvids,
+        'not_found_on_remote': not_found,
+        'next_step': 'run --mid %d --only %s --force' % (
+            mid, ','.join(reset_bvids)),
+    }, args.json_out)
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------- parser
 
 class _Parser(argparse.ArgumentParser):
@@ -1422,6 +1543,15 @@ def build_parser(with_top=True):
         'check-cred', help='验证 B 站 / 夸克凭据是否还有效，并给出过期时间'))
     add_json_out(p)
     p.set_defaults(func=cmd_check_cred)
+
+    p = add_common(sub.add_parser(
+        'repair', help='修复大小不符条目：删除夸克端文件并重置 state（配合 run --force 重传）'))
+    p.add_argument('--mid', type=int, default=None)
+    p.add_argument('--quark-dir', metavar='FID', help='目标目录 fid（不传则读 config.json）')
+    p.add_argument('--only', action='append', default=[], metavar='BV1,BV2',
+                   help='要修复的 BV 号（必填，支持逗号分隔多个）')
+    add_json_out(p)
+    p.set_defaults(func=cmd_repair)
 
     return ap
 

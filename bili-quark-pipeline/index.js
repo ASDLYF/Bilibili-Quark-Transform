@@ -1479,6 +1479,101 @@ export function apply(ctx, config = {}) {
     }),
   });
 
+  // ============================================================ repair（修复大小不符条目）
+  define({
+    name: 'bili_quark_repair',
+    description:
+      '修复与 B 站对比时大小不符的条目：删除夸克网盘上对应的文件，重置 state.jsonl 中这些条目的状态为 pending，' +
+      '然后返回待重跑的 BV 号列表。前端拿到结果后再调 bili_quark_run（only + force）重新下载上传。',
+    parameters: schema(
+      {
+        mid: COMMON_PROPS.mid,
+        quarkDir: {
+          type: 'string',
+          description: '夸克目标目录：fid 或路径。不传则用该 UP 主已保存的目录。',
+        },
+        only: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '要修复的 BV 号列表（必填，来自 check-src 返回的 size_mismatch 条目）',
+        },
+        biliCookie: COMMON_PROPS.biliCookie,
+        quarkCookie: COMMON_PROPS.quarkCookie,
+      },
+      ['mid', 'only'],
+    ),
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          deleted: { type: 'number' },
+          resetBvids: { type: 'array', items: { type: 'string' } },
+          notFoundOnRemote: { type: 'array', items: { type: 'string' } },
+          nextStep: { type: 'string' },
+          error: { type: 'string' },
+        },
+        required: ['ok'],
+      },
+      render(_a, v) {
+        if (!v.ok) return block(`修复失败：${v.error}`);
+        const lines = [
+          `修复完成：删除 ${v.deleted} 个远端文件，重置 ${v.resetBvids.length} 条 state`,
+        ];
+        if (v.notFoundOnRemote && v.notFoundOnRemote.length) {
+          lines.push(`  远端未找到（跳过删除）：${v.notFoundOnRemote.join(', ')}`);
+        }
+        lines.push(`  下一步：run --force 重传 ${v.resetBvids.join(', ')}`);
+        return block(lines.join('\n'));
+      },
+    },
+    isConcurrencySafe: () => false,
+    async execute(args) {
+      const mid = parseMid(args?.mid);
+      if (!mid) throw new Error('mid 无效');
+      const only = Array.isArray(args?.only) ? args.only.map(String) : [];
+      if (!only.length) throw new Error('only 不能为空');
+      const dir = assertBackend(cfg);
+      const work = workDirFor(cfg, mid);
+      const cliArgs = [
+        '-m',
+        'bili_quark.cli',
+        'repair',
+        ...backendBase(cfg, mid, work),
+      ];
+      for (const bv of only) cliArgs.push('--only', String(bv));
+
+      const dirArg = splitDirArg(args?.quarkDir);
+      if (dirArg.path || dirArg.fid) {
+        const resolved = await resolveDirToFid(cfg, dir, work, mid, dirArg, args);
+        if (!resolved.ok) return { ok: false, error: resolved.error };
+        if (resolved.fid) cliArgs.push('--quark-dir', resolved.fid);
+      }
+
+      const r = await runPythonJson(cfg, dir, cliArgs, {
+        work,
+        env: cookieEnv(cfg, args?.biliCookie, args?.quarkCookie),
+      });
+      if (!r.ok) {
+        return { ok: false, error: `${r.error}\n${r.log || ''}`.trim() };
+      }
+      const p = r.value;
+      return {
+        ok: true,
+        deleted: p.deleted ?? 0,
+        resetBvids: p.reset_bvids || [],
+        notFoundOnRemote: p.not_found_on_remote || [],
+        nextStep: p.next_step || '',
+      };
+    },
+    presentCall: (a) => ({
+      card: 'generic',
+      title: `修复大小不符 ${a?.mid ?? ''}`.trim(),
+      kind: 'other',
+      rawInput: a,
+    }),
+  });
+
   // ============================================================ auth（凭据有效性）
   define({
     name: 'bili_quark_auth',
