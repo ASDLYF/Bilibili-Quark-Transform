@@ -454,6 +454,9 @@ export function buildVideoList(cfg, resolvePaths, mid) {
     remoteFiles: remoteUsable ? Number(remoteIndex.remote_files) || 0 : 0,
     remoteDirFid: remoteUsable ? indexFid : '',
     remoteStale,
+    // 清单来源合集（抓取时记在 video_list.json 里）：0/空 = 全部投稿
+    seasonId: list.season_id || 0,
+    seasonName: list.season_name || '',
   };
 }
 
@@ -533,7 +536,7 @@ export function registerPanelRoutes(ctx, deps) {
       if (body === null) return { status: 400, json: { ok: false, error: '请求体不是合法 JSON' } };
       const action = String((body && body.action) || '');
       const mid = body && body.mid ? String(body.mid) : '';
-      const needsMid = ['targets', 'verify', 'runDry', 'run', 'stop', 'fetchList', 'saveDir', 'addUp', 'checkSrc', 'repair'];
+      const needsMid = ['targets', 'verify', 'runDry', 'run', 'stop', 'fetchList', 'saveDir', 'addUp', 'checkSrc', 'repair', 'seasons'];
       if (!mid && needsMid.includes(action)) {
         return { status: 400, json: { ok: false, error: '缺少 mid（B 站 UID）' } };
       }
@@ -602,9 +605,16 @@ export function registerPanelRoutes(ctx, deps) {
             create: body.create !== false,
           });
           break;
+        case 'seasons':
+          // 只列合集（一次只读接口，秒回），给面板做"选哪个合集"用
+          result = await callTool('bili_quark_seasons', { mid });
+          break;
         case 'fetchList':
-          // 抓取/刷新投稿清单（只读接口，不下载）
-          result = await callTool('bili_quark_fetch', { mid });
+          // 抓取/刷新投稿清单（只读接口，不下载）；给了 seasonId 就只抓该合集
+          result = await callTool('bili_quark_fetch', {
+            mid,
+            seasonId: body.seasonId ? Number(body.seasonId) : undefined,
+          });
           break;
         case 'saveDir':
           // 只保存目标目录，不抓清单（给已有会话换目录用）
@@ -621,8 +631,10 @@ export function registerPanelRoutes(ctx, deps) {
           const root = resolvePaths(cfg).workRoot || '';
           const listPath = root ? join(root, String(mid), 'video_list.json') : '';
           const steps = [];
-          if (!existsSync(listPath)) {
-            const fetched = await callTool('bili_quark_fetch', { mid });
+          const seasonId = body.seasonId ? Number(body.seasonId) : undefined;
+          // 指定了合集就一定重抓（用户是明确来换合集的），否则沿用"清单已有就不重抓"
+          if (seasonId || !existsSync(listPath)) {
+            const fetched = await callTool('bili_quark_fetch', { mid, seasonId });
             steps.push({ step: 'fetch', ok: fetched.ok !== false, error: fetched.error || '' });
             if (fetched.ok === false) {
               result = { ok: false, error: `抓取投稿清单失败：${fetched.error}`, steps };

@@ -78,6 +78,14 @@ window.__ModuleLoader__.load({
       qualityLabel: '分辨率',
       qualityMax: '最高画质',
       qualityHint: '降画质下载会在文件名后加 [1080p] 之类的标记，最高画质保持原名，不会和已上传的重名。',
+      // 合集选择浮层（添加 UP 主时，若该 UP 主有合集就先选一个）
+      seasonTitle: '该 UP 主有合集，先选一个要抓的范围',
+      seasonHint: '选中的合集只会抓该合集内的视频；选「全部投稿」则和以前一样抓整个空间。抓完可在「夸克目标目录」里设目录。',
+      seasonAll: '全部投稿（不按合集）',
+      seasonTotal: '条',
+      seasonCancel: '取消',
+      seasonLoading: '正在读取该 UP 主的合集列表…',
+      seasonSwitch: '换合集',
       checkSrc: '与B站核对',
       credCheck: '检测有效性',
       credChecking: '正在检测…',
@@ -493,6 +501,8 @@ window.__ModuleLoader__.load({
       const [checkMsg, setCheckMsg] = React.useState('');   // 「与B站核对」结果
       const [repairTargets, setRepairTargets] = React.useState([]); // checkSrc 返回的大小不符条目（bvid 列表）
       const [repairBusy, setRepairBusy] = React.useState(false);
+      const [seasonPick, setSeasonPick] = React.useState(null); // {mid, seasons} 选合集浮层
+      const [seasonBusy, setSeasonBusy] = React.useState(false);
       const [credInfo, setCredInfo] = React.useState(null); // 凭据检测结果
       const [credBusy, setCredBusy] = React.useState(false);
 
@@ -540,6 +550,27 @@ window.__ModuleLoader__.load({
         await reload();
       };
 
+      /** 读取某 UP 主的合集并弹选择浮层；没有合集就直接抓全部投稿。 */
+      const askSeasonsThenFetch = async (m) => {
+        // 先问后端要合集列表：该 UP 主有合集就先让用户选范围，再决定抓哪一份清单
+        setSeasonBusy(true);
+        setAddMsg(T.seasonLoading);
+        let seasons = [];
+        try {
+          const sr = await act('seasons', { mid: m });
+          if (sr && sr.ok) seasons = (sr.data && sr.data.seasons) || [];
+          else if (sr && sr.error) setAddMsg('读取合集失败（将直接抓全部投稿）：' + String(sr.error).slice(0, 160));
+        } catch (e) {
+          setAddMsg('读取合集失败（将直接抓全部投稿）：' + String((e && e.message) || e).slice(0, 160));
+        }
+        setSeasonBusy(false);
+        if (seasons.length) {
+          setSeasonPick({ mid: m, seasons });
+          return;
+        }
+        await runAddUp(m, 0);
+      };
+
       // 只做「抓取投稿清单」；目标目录交给下方目录卡片（saveDir），避免两处入口
       const addUp = async () => {
         const m = newMid.trim();
@@ -547,8 +578,22 @@ window.__ModuleLoader__.load({
           setAddMsg('请填写 UP 主的数字 UID，例如 3546918307236545');
           return;
         }
-        setAddMsg('正在抓取投稿清单（不下载视频，约需 1～3 分钟，请等这一步返回）…');
-        const r = await act('addUp', { mid: m });
+        await askSeasonsThenFetch(m);
+      };
+
+      /** 真正发起抓取；seasonId 为 0/空 表示抓全部投稿。 */
+      const runAddUp = async (m, seasonId) => {
+        setSeasonPick(null);
+        setSeasonBusy(true);
+        setAddMsg(seasonId
+          ? '正在抓取该合集（不下载视频，约需 1～3 分钟，请等这一步返回）…'
+          : '正在抓取投稿清单（不下载视频，约需 1～3 分钟，请等这一步返回）…');
+        let r = null;
+        try {
+          r = await act('addUp', { mid: m, seasonId: seasonId || undefined });
+        } finally {
+          setSeasonBusy(false);
+        }
         if (r && r.ok) {
           const added = String((r.data && r.data.mid) || m);
           setSelMid(added);
@@ -822,13 +867,10 @@ window.__ModuleLoader__.load({
           only,
           includeHorizontal: hasHorizontal,
           maxHeight: quality || undefined,
-          // 勾选即处理：本机记着「已上传」但夸克上其实没有的条目，也要真的重传一次
-          force: true,
         });
         setDirMsg(
           r && r.ok
-            ? `已启动，处理 ${only.length} 条（分辨率 ${quality ? quality + 'p' : '最高画质'}；` +
-              '已忽略本机「已完成」记录）'
+            ? `已启动，处理 ${only.length} 条（分辨率 ${quality ? quality + 'p' : '最高画质'}）`
             : '启动失败：' + String((r && r.error) || '未知错误').slice(0, 200),
         );
         await reload();
@@ -860,6 +902,15 @@ window.__ModuleLoader__.load({
           // 视频清单收进弹窗：主面板只留一个入口 + 已选计数
           active
             ? button(`${T.pickOpen}${sel.size ? `（已选 ${sel.size}）` : ''}`, () => setShowPicker(true))
+            : null,
+          // 当前清单来自哪个合集（抓合集时才有；抓全部投稿时不显示）
+          active && vids && vids.seasonName
+            ? h('span', { style: Object.assign({}, S.muted, { alignSelf: 'center' }) },
+                `清单来源：${vids.seasonName}（${vids.total} ${T.seasonTotal}）`)
+            : null,
+          // 换合集：直接回弹合集选择浮层（复用已选 UP 主的 mid，不必重新填 UID）
+          active && vids && vids.seasonName
+            ? button(T.seasonSwitch, () => askSeasonsThenFetch((active && active.mid) || selMid))
             : null,
           // 处理勾选的视频（横竖屏一视同仁）；没勾选时禁用
           active
@@ -1169,6 +1220,45 @@ window.__ModuleLoader__.load({
               },
             }, f.label),
           );
+
+        // ---- 合集选择浮层：添加 UP 主时该 UP 主有合集才出现
+        if (seasonPick) {
+          const seasonList = seasonPick.seasons || [];
+          const pickRow = (label, onClick, key) =>
+            h('button', {
+              key,
+              type: 'button',
+              className: 'bqbtn',
+              style: { textAlign: 'left', justifyContent: 'flex-start', width: '100%' },
+              onClick,
+            }, label);
+          children.push(
+            h(
+              'div',
+              { key: 'seasonpick', className: 'bqcard', style: S.modalCard },
+              h('div', { style: S.statLabel },
+                `${T.seasonTitle}（UID ${seasonPick.mid}）`),
+              h('div', { style: Object.assign({}, S.muted, { marginTop: '6px' }) }, T.seasonHint),
+              h(
+                'div',
+                { style: { marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '6px' } },
+                pickRow(T.seasonAll, () => runAddUp(seasonPick.mid, 0), 'season-all'),
+                ...seasonList.map((s) =>
+                  pickRow(
+                    `${s.name || ('合集 ' + s.seasonId)}（${s.total} ${T.seasonTotal}）`,
+                    () => runAddUp(seasonPick.mid, s.seasonId),
+                    'season-' + s.seasonId,
+                  )),
+              ),
+              h(
+                'div',
+                { className: 'bqpager' },
+                button(T.seasonCancel, () => { setSeasonPick(null); setAddMsg(''); },
+                  seasonBusy ? { opacity: 0.5 } : null),
+              ),
+            ),
+          );
+        }
 
         if (showPicker) {
         if (vidsLoading && !vids) {

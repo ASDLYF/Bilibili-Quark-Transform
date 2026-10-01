@@ -294,10 +294,14 @@ class BiliDownloader:
         os.makedirs(workdir, exist_ok=True)
 
     def get_playinfo(self, bvid, cid):
-        ik, sk = self.b.wbi
-        q = enc_wbi({'avid': 0, 'bvid': bvid, 'cid': cid, 'qn': 127, 'fnval': 4048,
-                     'fourk': 1, 'platform': 'pc', 'web_location': 1315873}, ik, sk)
-        d = self.b.get('https://api.bilibili.com/x/player/wbi/playurl?%s' % q)
+        # 走 Bili.signed()：412/429 风控时重新取 WBI key 并重新签名再试，
+        # 否则下载阶段一旦撞上封禁窗口就会整条失败。
+        d = self.b.signed(
+            'https://api.bilibili.com/x/player/wbi/playurl',
+            {'avid': 0, 'bvid': bvid, 'cid': cid, 'qn': 127, 'fnval': 4048,
+             'fourk': 1, 'platform': 'pc', 'web_location': 1315873},
+            referer='https://www.bilibili.com/video/%s' % bvid,
+            attempts=3)
         if d.get('code') != 0:
             raise RuntimeError('playurl code=%s msg=%s' % (d.get('code'), d.get('message')))
         return d['data']

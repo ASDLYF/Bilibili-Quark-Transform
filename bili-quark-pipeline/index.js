@@ -511,6 +511,10 @@ export function apply(ctx, config = {}) {
       {
         mid: COMMON_PROPS.mid,
         biliCookie: COMMON_PROPS.biliCookie,
+        seasonId: {
+          type: 'number',
+          description: '只抓指定合集内的视频（来自 bili_quark_seasons 的 seasonId）；不传则抓全部投稿',
+        },
         includeHorizontal: { type: 'boolean', description: '是否也包含横屏视频（默认 false，只保留竖屏）' },
       },
       ['mid'],
@@ -525,6 +529,8 @@ export function apply(ctx, config = {}) {
           vertical: { type: 'number' },
           horizontal: { type: 'number' },
           unknown: { type: 'number' },
+          seasonId: { type: 'number' },
+          seasonName: { type: 'string' },
           workDir: { type: 'string' },
           videoList: { type: 'string' },
           command: { type: 'string' },
@@ -536,7 +542,7 @@ export function apply(ctx, config = {}) {
         if (!v.ok) return block(`抓取失败：${v.error}`);
         return block(
           [
-            `UP 主 ${v.mid} 投稿抓取完成`,
+            `UP 主 ${v.mid} ${v.seasonName ? `合集「${v.seasonName}」` : '投稿'}抓取完成`,
             `  总投稿 ${v.total} 条 → 竖屏 ${v.vertical} / 横屏 ${v.horizontal} / 未知 ${v.unknown}`,
             `  清单：${v.videoList}`,
             '',
@@ -553,6 +559,8 @@ export function apply(ctx, config = {}) {
       const work = workDirFor(cfg, mid);
       const listPath = join(work, 'video_list.json');
       const cliArgs = ['-m', 'bili_quark.cli', 'fetch', ...backendBase(cfg, mid, work)];
+      const seasonId = args?.seasonId ? String(args.seasonId) : '';
+      if (seasonId) cliArgs.push('--season-id', seasonId);
       if (args?.includeHorizontal) cliArgs.push('--include-horizontal');
 
       const r = await runPythonJson(cfg, dir, cliArgs, {
@@ -580,6 +588,8 @@ export function apply(ctx, config = {}) {
         vertical: items.filter((x) => x.vertical === true).length,
         horizontal: items.filter((x) => x.vertical === false).length,
         unknown: items.filter((x) => x.vertical === null || x.vertical === undefined).length,
+        seasonId: list.season_id ? Number(list.season_id) : undefined,
+        seasonName: list.season_name || undefined,
         workDir: work,
         videoList: listPath,
         command: r.command,
@@ -589,6 +599,94 @@ export function apply(ctx, config = {}) {
       card: 'generic',
       title: `抓取 B 站 UP 主投稿 ${a?.mid ?? ''}`.trim(),
       kind: 'fetch',
+      rawInput: a,
+    }),
+  });
+
+  // ============================================================ seasons
+  define({
+    name: 'bili_quark_seasons',
+    description:
+      '列出某 B 站 UP 主的合集（合集/系列）。只读一次接口、不探测、秒回。' +
+      '有合集时可让用户选一个，再用 bili_quark_fetch 带 seasonId 只抓该合集。',
+    parameters: schema(
+      {
+        mid: COMMON_PROPS.mid,
+        biliCookie: COMMON_PROPS.biliCookie,
+      },
+      ['mid'],
+    ),
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          mid: { type: 'string' },
+          count: { type: 'number' },
+          seasons: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                seasonId: { type: 'number' },
+                name: { type: 'string' },
+                total: { type: 'number' },
+                cover: { type: 'string' },
+                description: { type: 'string' },
+                kind: { type: 'string' },
+              },
+            },
+          },
+          error: { type: 'string' },
+        },
+        required: ['ok', 'mid', 'count'],
+      },
+      render(_a, v) {
+        if (!v.ok) return block(`拉取合集列表失败：${v.error}`);
+        if (!v.count) return block(`UP 主 ${v.mid} 没有合集，直接 bili_quark_fetch 抓全部投稿即可。`);
+        return block(
+          [
+            `UP 主 ${v.mid} 共 ${v.count} 个合集：`,
+            ...v.seasons.map((s) => `  ${s.seasonId} | ${s.name} | ${s.total} 条`),
+            '',
+            '要对某个合集抓清单：bili_quark_fetch(mid, seasonId=<上面的 id>)。',
+          ].join('\n'),
+        );
+      },
+    },
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      const mid = parseMid(args?.mid);
+      if (!mid) throw new Error('mid 无效：需要数字 UID 或 space.bilibili.com 主页链接');
+      const dir = assertBackend(cfg);
+      const work = workDirFor(cfg, mid);
+      const cliArgs = ['-m', 'bili_quark.cli', 'seasons', ...backendBase(cfg, mid, work)];
+      const r = await runPythonJson(cfg, dir, cliArgs, {
+        work,
+        env: cookieEnv(cfg, args?.biliCookie, args?.quarkCookie),
+      });
+      if (!r.ok) {
+        return {
+          ok: false,
+          mid,
+          count: 0,
+          error: `${r.error}\n${r.log || ''}`.trim(),
+        };
+      }
+      const seasons = (r.value.seasons || []).map((s) => ({
+        seasonId: Number(s.season_id),
+        name: s.name || '',
+        total: Number(s.total) || 0,
+        cover: s.cover || '',
+        description: s.description || '',
+        kind: s.kind || 'season',
+      }));
+      return { ok: true, mid, count: seasons.length, seasons };
+    },
+    presentCall: (a) => ({
+      card: 'generic',
+      title: `列出 B 站 UP 主合集 ${a?.mid ?? ''}`.trim(),
+      kind: 'seasons',
       rawInput: a,
     }),
   });

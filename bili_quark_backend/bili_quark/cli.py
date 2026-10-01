@@ -40,8 +40,24 @@ EXIT_OK = 0
 EXIT_ARGS = 1
 EXIT_FAILED = 2
 
-COMMAND_NAMES = ('fetch', 'set-dir', 'resolve-dir', 'status', 'list', 'run', 'verify',
-                 'check-src', 'check-cred', 'repair')
+COMMAND_NAMES = ('fetch', 'seasons', 'set-dir', 'resolve-dir', 'status', 'list', 'run',
+                 'verify', 'check-src', 'check-cred', 'repair')
+
+
+def _fmt_dur(sec):
+    """秒 → "M:SS" / "H:MM:SS"。
+
+    合集接口只给秒数，投稿列表给的是现成的 length 字符串，这里补一个换算。
+    """
+    try:
+        sec = int(sec or 0)
+    except Exception:
+        return ''
+    if sec <= 0:
+        return ''
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return '%d:%02d:%02d' % (h, m, s) if h else '%d:%02d' % (m, s)
 
 
 # ---------------------------------------------------------------- 输出/日志
@@ -261,26 +277,53 @@ def cmd_fetch(args):
         return die(str(e), log=log)
     b = Bili(cookie)
     mid = int(args.mid)
+    season_id = getattr(args, 'season_id', None)
+    season_meta = None
 
-    # 1) 全量投稿列表（分页直到累计 >= count 或本页为空）
+    # 1) 拉取待探测的稿件清单
+    #    给了 --season-id 就只枚举该合集，否则走全量投稿（空间投稿接口）。
+    #    两个接口的条目字段不同：合集给 duration(秒) 且没有 description，
+    #    这里统一成投稿列表那套字段，后面的探测流程完全不用改。
     try:
         all_items, page = [], 1
         while True:
-            v = b.videos(mid, page, 30)
-            if v.get('code') != 0:
-                return die('投稿列表接口出错 page=%d code=%s msg=%s' % (
-                    page, v.get('code'), v.get('message')), log=log)
-            d = v['data']
-            lst = d.get('list', {}).get('vlist', [])
-            total = d.get('page', {}).get('count', 0)
+            if season_id:
+                v = b.season_archives(mid, season_id, page, 30)
+                if v.get('code') != 0:
+                    return die('合集内容接口出错 page=%d code=%s msg=%s' % (
+                        page, v.get('code'), v.get('message')), log=log)
+                d = v['data'] or {}
+                raw = d.get('archives') or []
+                total = (d.get('page') or {}).get('total', 0)
+                if season_meta is None:
+                    season_meta = d.get('meta') or {}
+                lst = [{
+                    'bvid': a.get('bvid'),
+                    'aid': a.get('aid'),
+                    'title': a.get('title'),
+                    'created': a.get('pubdate') or a.get('ctime'),
+                    'length': _fmt_dur(a.get('duration')),
+                    'description': '',
+                    'pic': a.get('pic'),
+                } for a in raw]
+            else:
+                v = b.videos(mid, page, 30)
+                if v.get('code') != 0:
+                    return die('投稿列表接口出错 page=%d code=%s msg=%s' % (
+                        page, v.get('code'), v.get('message')), log=log)
+                d = v['data']
+                lst = d.get('list', {}).get('vlist', [])
+                total = d.get('page', {}).get('count', 0)
             all_items.extend(lst)
-            log('列表 page %d: +%d（累计 %d / 总 %s）' % (page, len(lst), len(all_items), total))
+            log('%s page %d: +%d（累计 %d / 总 %s）' % (
+                '合集' if season_id else '列表', page, len(lst), len(all_items), total))
             if len(all_items) >= total or not lst:
                 break
             page += 1
             time.sleep(0.8)
     except Exception as e:
-        return die('拉取投稿列表失败：%s: %s' % (type(e).__name__, e), log=log)
+        return die('%s失败：%s: %s' % ('拉取合集内容' if season_id else '拉取投稿列表',
+                                     type(e).__name__, e), log=log)
 
     # 2) 逐条探测真实分辨率/时长
     #    竖屏判定**不看投稿列表字段**：逐条调 x/player/pagelist 拿 cid，
@@ -345,6 +388,10 @@ def cmd_fetch(args):
 
     payload = {'mid': mid, 'fetched_at': time.strftime('%Y-%m-%d %H:%M:%S'),
                'count': len(out), 'items': out}
+    if season_id:
+        # 记下来源合集：前端要显示"当前清单来自哪个合集"，重抓时也能回填
+        payload['season_id'] = int(season_id)
+        payload['season_name'] = (season_meta or {}).get('name') or ''
     core.atomic_write_json(layout.video_list, payload)
 
     ver = [x for x in out if x['vertical'] is True]
@@ -359,7 +406,68 @@ def cmd_fetch(args):
                          'width': x['width'], 'height': x['height'],
                          'duration': x['duration'], 'vertical': x['vertical']}
                         for x in out]}
+    if season_id:
+        result['season_id'] = int(season_id)
+        result['season_name'] = (season_meta or {}).get('name') or ''
     # --json-out 指出路径时，无论是否加 --json 都写文件（stdout 一并保留 JSON）
+    if args.json or args.json_out:
+        out_json(result, args.json_out)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------- seasons
+
+def cmd_seasons(args):
+    """列出 UP 主的合集/系列（只读一次接口，不探测，秒回）。
+
+    前端「添加 UP 主 / 抓取投稿清单」会先调这个：
+    有合集就先让用户选一个，再用 fetch --season-id <id> 抓该合集。
+    """
+    workdir = os.path.abspath(args.workdir or core.default_project_dir())
+    layout = core.Layout(workdir, args.video_list, args.state_file)
+    layout.ensure_dirs()
+    log = Logger(layout.runlog)
+    if args.mid is None:
+        return die('seasons 必须给 --mid <MID>', log=log)
+    try:
+        cookie = credentials.load_bili(workdir)
+    except credentials.CredentialError as e:
+        return die(str(e), log=log)
+    b = Bili(cookie)
+    mid = int(args.mid)
+
+    try:
+        # page_size 上限就是 20：给 50 会被拒（code=-400 请求错误）
+        d = b.seasons(mid, 1, 20)
+    except Exception as e:
+        return die('拉取合集列表失败：%s: %s' % (type(e).__name__, e), log=log)
+    if d.get('code') != 0:
+        return die('合集列表接口出错 code=%s msg=%s' % (
+            d.get('code'), d.get('message')), log=log)
+
+    il = (d.get('data') or {}).get('items_lists') or {}
+    seasons = []
+    # seasons_list 是「合集」，series_list 是「系列」（旧版列表），两者都收
+    for kind, key in (('season', 'seasons_list'), ('series', 'series_list')):
+        for it in (il.get(key) or []):
+            m = it.get('meta') or {}
+            sid = m.get('season_id')
+            if sid is None:
+                continue
+            seasons.append({
+                'season_id': sid,
+                'name': m.get('name') or '',
+                'total': m.get('total') or 0,
+                'cover': m.get('cover') or '',
+                'description': (m.get('description') or '')[:200],
+                'kind': kind,
+            })
+
+    log('合集 %d 个（mid=%s）' % (len(seasons), mid))
+    for s in seasons:
+        log('  %s | %s | %s 条' % (s['season_id'], (s['name'] or '')[:30], s['total']))
+
+    result = {'mid': mid, 'count': len(seasons), 'seasons': seasons}
     if args.json or args.json_out:
         out_json(result, args.json_out)
     return EXIT_OK
@@ -1440,11 +1548,19 @@ def build_parser(with_top=True):
     p = add_common(sub.add_parser('fetch', help='抓取 UP 主全部投稿并逐条探测真实分辨率/时长'))
     p.add_argument('--mid', default=None,
                    help='UP 主 mid（也可以写在子命令之前）；必填')
+    p.add_argument('--season-id', default=None,
+                   help='只抓该合集内的视频（来自 seasons 命令的 season_id）；不给则抓全部投稿')
     p.add_argument('--include-horizontal', action='store_true',
                    help='清单本身就包含全部条目（含横屏），此参数仅为显式说明')
     p.add_argument('--json', action='store_true', help='结果 JSON 打到 stdout')
     add_json_out(p)
     p.set_defaults(func=cmd_fetch)
+
+    p = add_common(sub.add_parser('seasons', help='列出 UP 主的合集/系列（只读接口，不探测）'))
+    p.add_argument('--mid', default=None, help='UP 主 mid；必填')
+    p.add_argument('--json', action='store_true', help='结果 JSON 打到 stdout')
+    add_json_out(p)
+    p.set_defaults(func=cmd_seasons)
 
     p = add_common(sub.add_parser('set-dir', help='把夸克目标目录写入 <workdir>/config.json'))
     p.add_argument('--fid', required=True, help='夸克目录 fid')

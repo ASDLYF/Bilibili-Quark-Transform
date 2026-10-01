@@ -5,10 +5,15 @@ import json
 import time
 import hashlib
 import os
+import random
 import re
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+# 412/429（风控）退避阶梯（秒）。B 站的封禁窗口实测可持续数分钟，
+# 早先固定 5/10/15 秒重试三次必然穿不过去，所以拉长到最长约 1.5 分钟一次。
+RETRY_BACKOFF = (5, 15, 30, 60, 90)
 
 MIXIN_TAB = [
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
@@ -47,30 +52,58 @@ class Bili:
         self.cache_dir = cache_dir
         self._wbi = None
 
-    def get(self, url, raw=False):
+    def get(self, url, raw=False, referer=None, retries=4):
         headers = {
             'User-Agent': UA,
-            'Referer': 'https://www.bilibili.com/',
+            'Referer': referer or 'https://www.bilibili.com/',
             'Origin': 'https://www.bilibili.com',
             'Accept': 'application/json, text/plain, */*',
         }
         if self.cookie:
             headers['Cookie'] = self.cookie
-        req = urllib.request.Request(url, headers=headers)
-        for attempt in range(4):
+        last = None
+        for attempt in range(retries):
+            req = urllib.request.Request(url, headers=headers)
             try:
                 body = urllib.request.urlopen(req, timeout=30).read()
                 return body if raw else json.loads(body)
             except urllib.error.HTTPError as e:
-                if e.code in (412, 429) and attempt < 3:
-                    time.sleep(5 * (attempt + 1))
+                last = e
+                if e.code in (412, 429) and attempt < retries - 1:
+                    wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                    time.sleep(wait + random.uniform(0, 3))
                     continue
                 raise
             except Exception:
-                if attempt < 3:
-                    time.sleep(3)
+                if attempt < retries - 1:
+                    time.sleep(3 + random.uniform(0, 2))
                     continue
                 raise
+        if last:
+            raise last
+
+    def signed(self, api, params, referer=None, attempts=5):
+        """WBI 签名请求；遇 412/429 时重新拉取 WBI key 并重新签名再试。
+
+        单次 ``get()`` 重试复用同一个 ``w_rid``（``wts`` 被冻结在第一次签名里），
+        在风控窗口内几乎必然继续 412。这里每一轮都重新取 key、重新签名，
+        才有可能穿过封禁窗口。
+        """
+        last = None
+        for i in range(attempts):
+            img_key, sub_key = self.wbi
+            q = enc_wbi(params, img_key, sub_key)
+            try:
+                return self.get('%s?%s' % (api, q), referer=referer, retries=1)
+            except urllib.error.HTTPError as e:
+                last = e
+                if e.code not in (412, 429):
+                    raise
+                self._wbi = None            # 下一轮强制重新拉 nav 取新 key
+                wait = RETRY_BACKOFF[min(i, len(RETRY_BACKOFF) - 1)]
+                time.sleep(wait + random.uniform(0, 3))
+        if last:
+            raise last
 
     @property
     def wbi(self):
@@ -86,32 +119,54 @@ class Bili:
         return self.get('https://api.bilibili.com/x/web-interface/card?mid=%d' % mid)
 
     def space_info(self, mid):
-        img_key, sub_key = self.wbi
-        q = enc_wbi({'mid': mid, 'platform': 'web', 'web_location': 1550101},
-                    img_key, sub_key)
-        return self.get('https://api.bilibili.com/x/space/wbi/acc/info?%s' % q)
+        return self.signed('https://api.bilibili.com/x/space/wbi/acc/info',
+                           {'mid': mid, 'platform': 'web', 'web_location': 1550101},
+                           referer='https://space.bilibili.com/%s' % mid)
 
     def videos(self, mid, page=1, size=30, order='pubdate'):
         """UP 主投稿列表（含竖屏投稿，使用空间投稿接口）。"""
-        img_key, sub_key = self.wbi
         params = {
             'mid': mid, 'ps': size, 'pn': page, 'tid': 0, 'keyword': '',
             'order': order, 'platform': 'web', 'web_location': 1550101,
             'index': 0, 'order_avoided': 'true',
         }
-        q = enc_wbi(params, img_key, sub_key)
-        return self.get('https://api.bilibili.com/x/space/wbi/arc/search?%s' % q)
+        return self.signed('https://api.bilibili.com/x/space/wbi/arc/search', params,
+                           referer='https://space.bilibili.com/%s' % mid)
+
+    def seasons(self, mid, page=1, size=20):
+        """UP 主的合集/系列列表（只读，不探测）。
+
+        返回 ``data.items_lists.seasons_list``（合集）与 ``series_list``（系列），
+        每项形如 ``{'meta': {'season_id', 'name', 'total', 'cover', 'description'}}``。
+        这个接口不带 WBI 也能通，用普通 get 即可（412 退避在 get 里）。
+        """
+        url = ('https://api.bilibili.com/x/polymer/web-space/seasons_series_list'
+               '?mid=%s&page_num=%d&page_size=%d&web_location=333.1387'
+               % (mid, page, size))
+        return self.get(url, referer='https://space.bilibili.com/%s' % mid)
+
+    def season_archives(self, mid, season_id, page=1, size=30, sort_reverse=False):
+        """某个合集内的视频列表（只读，不探测）。
+
+        ``data.archives`` 每项含 bvid/aid/title/pic/pubdate/duration/stat，
+        注意**没有 cid**：分集信息仍要靠 x/player/pagelist 逐条取。
+        """
+        url = ('https://api.bilibili.com/x/polymer/web-space/seasons_archives_list'
+               '?mid=%s&season_id=%s&page_num=%d&page_size=%d&sort_reverse=%s'
+               '&web_location=333.1387'
+               % (mid, season_id, page, size, 'true' if sort_reverse else 'false'))
+        return self.get(url, referer='https://space.bilibili.com/%s' % mid)
 
     def playurl(self, bvid, cid):
         """取播放地址，返回 (width, height, duration, formats)。"""
-        img_key, sub_key = self.wbi
         params = {
             'avid': 0, 'bvid': bvid, 'cid': cid, 'qn': 127, 'fnval': 4048,
             'fourk': 1, 'platform': 'pc', 'web_location': 1315873,
         }
-        q = enc_wbi(params, img_key, sub_key)
-        api = 'https://api.bilibili.com/x/player/wbi/playurl?%s' % q
-        d = self.get(api)
+        # 逐条探测时调用量最大，退避别拖太久：3 轮封顶
+        d = self.signed('https://api.bilibili.com/x/player/wbi/playurl', params,
+                        referer='https://www.bilibili.com/video/%s' % bvid,
+                        attempts=3)
         if d.get('code') != 0:
             return None
         data = d['data']
