@@ -150,7 +150,7 @@ def remote_size(url, referer='https://www.bilibili.com/', timeout=30, retries=3)
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=hdrs)
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with http_util.opener().open(req, timeout=timeout) as r:
                 cr = r.headers.get('Content-Range') or ''
                 m = re.search(r'/(\d+)\s*$', cr)
                 if m:
@@ -166,8 +166,12 @@ def remote_size(url, referer='https://www.bilibili.com/', timeout=30, retries=3)
 
 
 def download(url, dest, referer='https://www.bilibili.com/', log=print,
-             label='', retries=4, on_progress=None):
+             label='', retries=12, on_progress=None):
     """带断点续传的下载。返回文件大小。
+
+    B 站 CDN 在限速时会「喂一段就 FIN」——连接被正常关闭、但字节数不够。
+    所以这里把「被截断」当常态：每轮都带 Range 从已有字节续传，只要本轮比上轮
+    多下了字节就继续重试，**连续 3 轮零进展**才放弃（避免对真死的 URL 空转）。
 
     :param on_progress: 可选回调 ``on_progress(done_bytes, total_bytes, speed)``，
         约每 0.8s 调一次（上限），给上层写实时进度用；抛异常会被忽略，
@@ -177,22 +181,30 @@ def download(url, dest, referer='https://www.bilibili.com/', log=print,
     have = os.path.getsize(part) if os.path.exists(part) else 0
     hdrs = {'User-Agent': UA, 'Referer': referer,
             'Origin': 'https://www.bilibili.com', 'Accept': '*/*'}
-    if have:
-        hdrs['Range'] = 'bytes=%d-' % have
-    req = urllib.request.Request(url, headers=hdrs)
     t0 = time.time()
     # 0 而不是 t0：第一个 chunk 就上报一次，短下载/快网也不会「进度条一直 0」
     last_cb = 0.0
+    total = None
+    stale = 0
     for attempt in range(retries):
+        ta = time.time()
+        before = have
+        if have:
+            hdrs['Range'] = 'bytes=%d-' % have
+        else:
+            hdrs.pop('Range', None)
+        req = urllib.request.Request(url, headers=hdrs)
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                total = r.headers.get('Content-Length')
-                total = (int(total) + have) if total else None
+            with http_util.opener().open(req, timeout=60) as r:
+                cl = r.headers.get('Content-Length')
+                total = (int(cl) + have) if cl else None
                 mode = 'ab' if (have and r.status == 206) else 'wb'
                 if mode == 'wb':
+                    # 服务端忽略了 Range（回 200），只能从头重下
                     have = 0
+                    before = 0
                 done = have
-                last = t0
+                last = ta
                 with open(part, mode) as f:
                     while True:
                         chunk = r.read(262144)
@@ -202,7 +214,7 @@ def download(url, dest, referer='https://www.bilibili.com/', log=print,
                         done += len(chunk)
                         now = time.time()
                         if now - last > 2.0 and total:
-                            sp = done / max(now - t0, 0.001)
+                            sp = (done - before) / max(now - ta, 0.001)
                             log('      %s %.1f%% (%.0f/%.0f MB, %.1f MB/s)' % (
                                 label, done * 100.0 / total, done / 2**20,
                                 total / 2**20, sp / 2**20))
@@ -210,7 +222,8 @@ def download(url, dest, referer='https://www.bilibili.com/', log=print,
                         if on_progress and total and (now - last_cb > 0.8 or done >= total):
                             last_cb = now
                             try:
-                                on_progress(done, total, done / max(now - t0, 0.001))
+                                on_progress(done, total,
+                                            (done - before) / max(now - ta, 0.001))
                             except Exception:
                                 pass
             if total and os.path.getsize(part) < total:
@@ -218,13 +231,18 @@ def download(url, dest, referer='https://www.bilibili.com/', log=print,
             os.replace(part, dest)
             return os.path.getsize(dest)
         except Exception as e:
+            have = os.path.getsize(part) if os.path.exists(part) else 0
             if attempt == retries - 1:
                 raise
-            log('      %s 重试 %d/%d: %s' % (label, attempt + 1, retries, e))
-            time.sleep(3 * (attempt + 1))
-            have = os.path.getsize(part) if os.path.exists(part) else 0
-            hdrs['Range'] = 'bytes=%d-' % have
-            req = urllib.request.Request(url, headers=hdrs)
+            stale = 0 if have > before else stale + 1
+            if stale >= 3:
+                raise RuntimeError(
+                    '下载连续 %d 轮零进展（%d/%s 字节，共试 %d 次）: %s' % (
+                        stale, have, total if total else '?', attempt + 1, e))
+            log('      %s 重试 %d/%d: %s（本轮 +%.1f MB，已续传 %.1f/%s MB）' % (
+                label, attempt + 1, retries, e, (have - before) / 2**20,
+                have / 2**20, ('%.1f' % (total / 2**20)) if total else '?'))
+            time.sleep(min(1.5 * (attempt + 1), 8))
     raise RuntimeError('unreachable')
 
 

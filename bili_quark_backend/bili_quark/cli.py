@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import bili_quark                                     # noqa: F401  修好 sys.path
 from bili_api import Bili
@@ -264,6 +264,158 @@ def _file_time(path):
 
 # ---------------------------------------------------------------- fetch
 
+def _enumerate_items(b, mid, season_id, log):
+    """枚举待探测的稿件清单（合集 or 全量投稿）。
+
+    给了 season_id 就只枚举该合集，否则走全量投稿（空间投稿接口）。
+    两个接口的条目字段不同：合集给 duration(秒) 且没有 description，
+    这里统一成投稿列表那套字段，后面的探测流程完全不用改。
+    """
+    all_items, page, season_meta = [], 1, None
+    while True:
+        if season_id:
+            v = b.season_archives(mid, season_id, page, 30)
+            if v.get('code') != 0:
+                raise RuntimeError('合集内容接口出错 page=%d code=%s msg=%s' % (
+                    page, v.get('code'), v.get('message')))
+            d = v['data'] or {}
+            raw = d.get('archives') or []
+            total = (d.get('page') or {}).get('total', 0)
+            if season_meta is None:
+                season_meta = d.get('meta') or {}
+            lst = [{
+                'bvid': a.get('bvid'),
+                'aid': a.get('aid'),
+                'title': a.get('title'),
+                'created': a.get('pubdate') or a.get('ctime'),
+                'length': _fmt_dur(a.get('duration')),
+                'description': '',
+                'pic': a.get('pic'),
+                # 合集接口其实**没有** is_charging_arc（字段集和空间投稿完全不同），
+                # 这里只是留个统一入口；合集里的充电专属只能靠「0 档流」兜底识别。
+                'charging': bool(a.get('is_charging_arc')),
+            } for a in raw]
+        else:
+            v = b.videos(mid, page, 30)
+            if v.get('code') != 0:
+                raise RuntimeError('投稿列表接口出错 page=%d code=%s msg=%s' % (
+                    page, v.get('code'), v.get('message')))
+            d = v['data']
+            lst = d.get('list', {}).get('vlist', [])
+            total = d.get('page', {}).get('count', 0)
+        all_items.extend(lst)
+        log('%s page %d: +%d（累计 %d / 总 %s）' % (
+            '合集' if season_id else '列表', page, len(lst), len(all_items), total))
+        if len(all_items) >= total or not lst:
+            break
+        page += 1
+        time.sleep(0.8)
+    return all_items, season_meta
+
+
+def _unknown_rec(it):
+    """探测彻底失败（连 rec 都没构造出来）时的兜底条目：标成「未知」。
+
+    宁可留个未知条目，也不要因为一次异常让这条永远留在 pending 里、每批都重试一遍。
+    """
+    return {
+        'bvid': it.get('bvid'), 'aid': it.get('aid'), 'cid': None,
+        'title': it.get('title'), 'created': it.get('created'),
+        'date': time.strftime('%Y-%m-%d', time.localtime(it.get('created') or 0)),
+        'length': it.get('length'),
+        'description': (it.get('description') or '')[:200],
+        'pic': it.get('pic'),
+        'width': None, 'height': None, 'duration': None,
+        'pages': [], 'page_count': 1, 'vertical': None, 'ratio': None,
+    }
+
+
+def _probe_item(b, it, log):
+    """探测单条稿件：pagelist 拿 cid → playurl 拿 dash 宽高。
+
+    返回 ``(rec, locked)``，两者最多一个非 None：
+
+    * ``rec``    —— 探测成功的清单条目（``vertical`` 可能是 None = 未知）
+    * ``locked`` —— 服务端**明确**回了「一档流都没有」，说明当前 cookie 下不了，需剔除。
+      playurl 全程抛异常属于网络问题，那属于「未知」，仍要出 rec ——
+      不能因为一次抽风就把视频永久踢出清单。
+    """
+    bvid = it['bvid']
+    cid = None
+    pages = []
+    try:
+        pl = b.get('https://api.bilibili.com/x/player/pagelist?bvid=%s' % bvid)
+        if pl.get('code') == 0 and pl.get('data'):
+            # 顺手把全部分集记下来：面板要能给多 P 视频选具体下载哪一集
+            for p in pl['data']:
+                pages.append({
+                    'cid': p.get('cid'),
+                    'page': p.get('page') or (len(pages) + 1),
+                    'part': (p.get('part') or '')[:120],
+                    'duration': p.get('duration'),
+                })
+            cid = pages[0]['cid']
+    except Exception as e:
+        log('  pagelist 失败 %s：%s' % (bvid, e))
+    info = None
+    got_response = False
+    is_charging = bool(it.get('charging') or it.get('is_charging_arc'))
+    if cid:
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                info = b.playurl(bvid, cid)
+                got_response = True
+                if info and info.get('streams'):
+                    break
+                # code=0 但 dash 一档流都没有 = 这个 cookie 没有下载权限。
+                # 这是服务端**明确**的答复，不是网络抖动，复核一次就够 ——
+                # 否则一个 UP 有几十条充电视频时，长退避会白等几十分钟。
+                if attempt >= 2:
+                    log('  playurl 无可用流 %s（复核 %d 次，判定不可下载）' % (bvid, attempt))
+                    break
+                log('  playurl 无可用流 %s（复核中…）' % bvid)
+                time.sleep(1)
+            except Exception as e:
+                # 抛异常才可能是网络抖动，保守多试几次
+                got_response = False
+                info = None
+                if attempt >= 3:
+                    log('  playurl 失败 %s（第 %d 次，放弃）：%s' % (bvid, attempt, e))
+                    break
+                log('  playurl 失败 %s（第 %d 次）：%s' % (bvid, attempt, e))
+                time.sleep(2 + attempt * 3)
+    # 接口明确回了「没有流」→ 这个 cookie 下不了，剔除，不写进清单
+    if got_response and not (info or {}).get('streams'):
+        reason = ('充电专属（当前账号未充电，无下载权限）' if is_charging
+                  else '无可用流（充电专属 / 大会员专享 / 地区受限）')
+        return None, {'bvid': bvid, 'title': it.get('title'), 'reason': reason}
+    rec = {
+        'bvid': bvid,
+        'aid': it.get('aid'),
+        'cid': cid,
+        'title': it.get('title'),
+        'created': it.get('created'),
+        'date': time.strftime('%Y-%m-%d', time.localtime(it.get('created') or 0)),
+        'length': it.get('length'),
+        'description': (it.get('description') or '')[:200],
+        'pic': it.get('pic'),
+        'width': info['width'] if info else None,
+        'height': info['height'] if info else None,
+        'duration': info['duration'] if info else None,
+        'pages': pages,
+        'page_count': len(pages) or 1,
+    }
+    if rec['width'] and rec['height']:
+        rec['vertical'] = rec['height'] > rec['width']
+        rec['ratio'] = round(rec['width'] / rec['height'], 4)
+    else:
+        rec['vertical'] = None
+        rec['ratio'] = None
+    return rec, None
+
+
 def cmd_fetch(args):
     workdir = os.path.abspath(args.workdir or core.default_project_dir())
     layout = core.Layout(workdir, args.video_list, args.state_file)
@@ -278,136 +430,177 @@ def cmd_fetch(args):
     b = Bili(cookie)
     mid = int(args.mid)
     season_id = getattr(args, 'season_id', None)
+    season_id = int(season_id) if season_id else None
     season_meta = None
+    limit = getattr(args, 'limit', None) or 0
+    refresh = bool(getattr(args, 'refresh', False))
+    concurrency = max(1, min(16, int(getattr(args, 'probe_concurrency', None) or 4)))
 
-    # 1) 拉取待探测的稿件清单
-    #    给了 --season-id 就只枚举该合集，否则走全量投稿（空间投稿接口）。
-    #    两个接口的条目字段不同：合集给 duration(秒) 且没有 description，
-    #    这里统一成投稿列表那套字段，后面的探测流程完全不用改。
-    try:
-        all_items, page = [], 1
-        while True:
-            if season_id:
-                v = b.season_archives(mid, season_id, page, 30)
-                if v.get('code') != 0:
-                    return die('合集内容接口出错 page=%d code=%s msg=%s' % (
-                        page, v.get('code'), v.get('message')), log=log)
-                d = v['data'] or {}
-                raw = d.get('archives') or []
-                total = (d.get('page') or {}).get('total', 0)
-                if season_meta is None:
-                    season_meta = d.get('meta') or {}
-                lst = [{
-                    'bvid': a.get('bvid'),
-                    'aid': a.get('aid'),
-                    'title': a.get('title'),
-                    'created': a.get('pubdate') or a.get('ctime'),
-                    'length': _fmt_dur(a.get('duration')),
-                    'description': '',
-                    'pic': a.get('pic'),
-                } for a in raw]
-            else:
-                v = b.videos(mid, page, 30)
-                if v.get('code') != 0:
-                    return die('投稿列表接口出错 page=%d code=%s msg=%s' % (
-                        page, v.get('code'), v.get('message')), log=log)
-                d = v['data']
-                lst = d.get('list', {}).get('vlist', [])
-                total = d.get('page', {}).get('count', 0)
-            all_items.extend(lst)
-            log('%s page %d: +%d（累计 %d / 总 %s）' % (
-                '合集' if season_id else '列表', page, len(lst), len(all_items), total))
-            if len(all_items) >= total or not lst:
-                break
-            page += 1
-            time.sleep(0.8)
-    except Exception as e:
-        return die('%s失败：%s: %s' % ('拉取合集内容' if season_id else '拉取投稿列表',
-                                     type(e).__name__, e), log=log)
+    # 0) 已有清单 & 已缓存的投稿枚举。
+    #    大 UP 动辄几千条投稿，逐条 playurl 探测要几十分钟，远超宿主的同步调用超时
+    #    （backendTimeoutMs，默认 20 分钟）。所以这里做两件事：
+    #      * 把「投稿枚举」缓存到 workdir/video_raw.json —— 重新枚举要翻几十页接口，
+    #        分批抓取时每批都重翻一遍太浪费；
+    #      * 每次最多探测 --limit 条，进度直接落在 video_list.json 里，可断点续抓。
+    #    上层按结果里的 pending 循环调用，直到 pending=0。
+    prev = {}
+    if os.path.exists(layout.video_list):
+        try:
+            with open(layout.video_list, encoding='utf-8') as fh:
+                prev = json.load(fh) or {}
+        except Exception as e:
+            log('读取已有清单失败（当作空的）：%s' % e)
+            prev = {}
+    # 清单来源换了（全量投稿 ↔ 某个合集）就整体作废，否则会把另一个来源的条目混进来
+    if (prev.get('season_id') or None) != (season_id or None):
+        prev = {}
 
-    # 2) 逐条探测真实分辨率/时长
+    raw_cache = os.path.join(workdir, 'video_raw.json')
+    all_items = None
+    if not refresh and os.path.exists(raw_cache):
+        try:
+            with open(raw_cache, encoding='utf-8') as fh:
+                rc = json.load(fh) or {}
+            if (rc.get('season_id') or None) == (season_id or None) and rc.get('items'):
+                all_items = rc['items']
+                season_meta = rc.get('season_meta') or {}
+                log('复用已缓存的投稿枚举 %d 条（%s）；要重新拉列表请用 --refresh'
+                    % (len(all_items), raw_cache))
+        except Exception as e:
+            log('读取投稿枚举缓存失败，将重新拉取：%s' % e)
+
+    # 1) 拉取待探测的稿件清单（没有缓存，或用户要求 --refresh）
+    if all_items is None:
+        try:
+            all_items, season_meta = _enumerate_items(b, mid, season_id, log)
+        except Exception as e:
+            return die('%s失败：%s: %s' % ('拉取合集内容' if season_id else '拉取投稿列表',
+                                         type(e).__name__, e), log=log)
+        core.atomic_write_json(raw_cache, {
+            'mid': mid, 'season_id': season_id,
+            'fetched_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'enum_total': len(all_items), 'items': all_items,
+            'season_meta': season_meta or {},
+        })
+
+    # 1.5) 充电专属：接口不报错（playurl 返回 code=0、dash 却是空的），所以它既进不了
+    #      「失败」也拿不到分辨率，会被扔进「未知」桶 —— 用户一开 --include-horizontal，
+    #      「未知」就会被算进目标，跑到下载环节才炸。必须在筛选期就处理掉。
+    #
+    #      **但绝不能只看 is_charging_arc 就剔人**：那个字段说的是"这条投稿是充电专属"，
+    #      跟"当前这个 cookie 有没有权限"完全是两回事。用户如果确实给这个 UP 充过电，
+    #      playurl 是照常返回流的，那种视频必须照下不误。唯一权威的判据是
+    #      playurl 到底有没有返回流（见 _probe_item）；is_charging_arc 只用来给剔除原因
+    #      贴标签、并在无流时短路掉多余的重试。
+    probed = {x['bvid']: x for x in (prev.get('items') or []) if x.get('bvid')}
+    locked_map = {x['bvid']: x for x in (prev.get('locked_items') or []) if x.get('bvid')}
+    in_enum = set(it['bvid'] for it in all_items)
+    # 枚举里已经没有的（UP 删了稿）直接丢掉，别让旧条目一直挂在清单里
+    probed = dict((k, v) for k, v in probed.items() if k in in_enum)
+    locked_map = dict((k, v) for k, v in locked_map.items() if k in in_enum)
+    if refresh:
+        # --refresh 的语义 = 「重新抓取清单」：用户充完电要能把之前剔掉的充电视频捡回来，
+        # 所以清空 locked 记录让它们重新走一遍探测；已经探测成功的不必重跑。
+        locked_map = {}
+
+    todo = [it for it in all_items
+            if it['bvid'] not in probed and it['bvid'] not in locked_map]
+    if limit > 0 and len(todo) > limit:
+        log('本次只探测前 %d 条（还有 %d 条留到下一批）' % (limit, len(todo) - limit))
+        todo = todo[:limit]
+    log('待探测 %d 条（枚举共 %d 条，已有结果 %d 条，已剔除 %d 条，并发 %d）' % (
+        len(todo), len(all_items), len(probed), len(locked_map), concurrency))
+
+    # 2) 探测真实分辨率/时长
     #    竖屏判定**不看投稿列表字段**：逐条调 x/player/pagelist 拿 cid，
     #    再调 x/player/wbi/playurl（qn=127&fnval=4048&fourk=1，WBI 签名）
     #    用 dash 的 width/height 判断 height > width。
-    out = []
-    for i, it in enumerate(all_items, 1):
-        bvid = it['bvid']
-        cid = None
-        pages = []
-        try:
-            pl = b.get('https://api.bilibili.com/x/player/pagelist?bvid=%s' % bvid)
-            if pl.get('code') == 0 and pl.get('data'):
-                # 顺手把全部分集记下来：面板要能给多 P 视频选具体下载哪一集
-                for p in pl['data']:
-                    pages.append({
-                        'cid': p.get('cid'),
-                        'page': p.get('page') or (len(pages) + 1),
-                        'part': (p.get('part') or '')[:120],
-                        'duration': p.get('duration'),
-                    })
-                cid = pages[0]['cid']
-        except Exception as e:
-            log('  pagelist 失败 %s：%s' % (bvid, e))
-        info = None
-        if cid:
-            for attempt in range(3):
+    #    并发跑：每条 2 个请求 + 一点间隔，几千条串行必然超过宿主超时；
+    #    每个线程用**自己的 Bili 实例**（WBI key 缓存在实例属性上，不共享可变状态）。
+    new_recs, new_locked, done = [], [], 0
+    if todo:
+        tls = threading.local()
+
+        def _worker(item):
+            if not hasattr(tls, 'bili'):
+                tls.bili = Bili(cookie)
+            return _probe_item(tls.bili, item, log)
+
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            futs = dict((ex.submit(_worker, it), it) for it in todo)
+            for fu in as_completed(futs):
+                it = futs[fu]
+                done += 1
                 try:
-                    info = b.playurl(bvid, cid)
-                    break
+                    rec, lk = fu.result()
                 except Exception as e:
-                    log('  playurl 失败 %s（第 %d 次）：%s' % (bvid, attempt + 1, e))
-                    time.sleep(2 + attempt * 3)
-        rec = {
-            'bvid': bvid,
-            'aid': it.get('aid'),
-            'cid': cid,
-            'title': it.get('title'),
-            'created': it.get('created'),
-            'date': time.strftime('%Y-%m-%d', time.localtime(it.get('created') or 0)),
-            'length': it.get('length'),
-            'description': (it.get('description') or '')[:200],
-            'pic': it.get('pic'),
-            'width': info['width'] if info else None,
-            'height': info['height'] if info else None,
-            'duration': info['duration'] if info else None,
-            'pages': pages,
-            'page_count': len(pages) or 1,
-        }
-        if rec['width'] and rec['height']:
-            rec['vertical'] = rec['height'] > rec['width']
-            rec['ratio'] = round(rec['width'] / rec['height'], 4)
-        else:
-            rec['vertical'] = None
-            rec['ratio'] = None
-        out.append(rec)
-        log('[%2d/%d] %s %sx%s %s %s' % (
-            i, len(all_items), bvid, rec['width'], rec['height'],
-            '竖屏' if rec['vertical'] else ('横屏' if rec['vertical'] is False else '未知'),
-            (rec['title'] or '')[:28]))
-        time.sleep(0.5)
+                    log('  探测异常 %s：%s: %s' % (it.get('bvid'), type(e).__name__, e))
+                    rec, lk = _unknown_rec(it), None
+                title = (it.get('title') or '')[:28]
+                if lk:
+                    new_locked.append(lk)
+                    log('[%d/%d] %s 剔除：%s %s' % (
+                        done, len(todo), lk['bvid'], lk['reason'], title))
+                elif rec:
+                    new_recs.append(rec)
+                    log('[%d/%d] %s %sx%s %s %s' % (
+                        done, len(todo), rec['bvid'], rec['width'], rec['height'],
+                        '竖屏' if rec['vertical'] else
+                        ('横屏' if rec['vertical'] is False else '未知'), title))
+                else:
+                    log('[%d/%d] %s 探测无结果，留到下一批重试' % (done, len(todo), it.get('bvid')))
+
+    # 3) 合并：按枚举顺序重排，保证清单顺序稳定（前端按顺序展示、挑分集）
+    for rec in new_recs:
+        probed[rec['bvid']] = rec
+        locked_map.pop(rec['bvid'], None)
+    for x in new_locked:
+        locked_map[x['bvid']] = x
+        probed.pop(x['bvid'], None)
+    out = [probed[it['bvid']] for it in all_items if it['bvid'] in probed]
+    locked = [locked_map[it['bvid']] for it in all_items if it['bvid'] in locked_map]
+    pending = [it for it in all_items
+               if it['bvid'] not in probed and it['bvid'] not in locked_map]
+
+    if locked:
+        # 充电视频可能几十上百条，日志只列前 20 条，避免刷屏；完整清单在 locked_items 里
+        log('以下 %d 条下不了，已剔除、不写入清单：' % len(locked))
+        for x in locked[:20]:
+            log('  - %s %s（%s）' % (x['bvid'], (x.get('title') or '')[:30], x.get('reason')))
+        if len(locked) > 20:
+            log('  … 另有 %d 条，见清单文件的 locked_items' % (len(locked) - 20))
 
     payload = {'mid': mid, 'fetched_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-               'count': len(out), 'items': out}
+               'count': len(out), 'enum_total': len(all_items),
+               'pending': len(pending), 'items': out}
+    if locked:
+        payload['locked'] = len(locked)
+        payload['locked_items'] = locked
     if season_id:
         # 记下来源合集：前端要显示"当前清单来自哪个合集"，重抓时也能回填
-        payload['season_id'] = int(season_id)
+        payload['season_id'] = season_id
         payload['season_name'] = (season_meta or {}).get('name') or ''
     core.atomic_write_json(layout.video_list, payload)
 
     ver = [x for x in out if x['vertical'] is True]
     hor = [x for x in out if x['vertical'] is False]
     unk = [x for x in out if x['vertical'] is None]
-    log('竖屏 %d / 横屏 %d / 未知 %d，已写入 %s' % (
-        len(ver), len(hor), len(unk), layout.video_list))
+    log('本批探测 %d 条 → 清单已有 %d 条：竖屏 %d / 横屏 %d / 未知 %d%s%s' % (
+        len(todo), len(out), len(ver), len(hor), len(unk),
+        ('，剔除不可下载 %d 条' % len(locked)) if locked else '',
+        ('；还剩 %d 条未探测（请再抓一次）' % len(pending)) if pending else ''))
     result = {'mid': mid, 'count': len(out), 'vertical': len(ver),
               'horizontal': len(hor), 'unknown': len(unk),
+              'locked': len(locked), 'locked_items': locked,
+              'enum_total': len(all_items), 'pending': len(pending),
+              'has_more': bool(pending), 'processed': len(todo),
               'video_list': layout.video_list,
               'items': [{'bvid': x['bvid'], 'title': x['title'],
                          'width': x['width'], 'height': x['height'],
                          'duration': x['duration'], 'vertical': x['vertical']}
                         for x in out]}
     if season_id:
-        result['season_id'] = int(season_id)
+        result['season_id'] = season_id
         result['season_name'] = (season_meta or {}).get('name') or ''
     # --json-out 指出路径时，无论是否加 --json 都写文件（stdout 一并保留 JSON）
     if args.json or args.json_out:
@@ -985,6 +1178,10 @@ def cmd_run(args):
                                concurrency=args.part_concurrency, on_progress=up_cb)
             rec['upload_seconds'] = round(time.time() - t1, 1)
             rec['task_id'] = res['task_id']
+            # 收尾任务的诊断信息：目录里找不到文件时，靠这几个字段定位是
+            # 「提交失败」还是「索引延迟/被改名」。
+            rec['obj_key'] = res.get('obj_key') or ''
+            rec['finish_status'] = res.get('finish_status')
             progress.stage_sync(bvid, 'upload', 100.0)
 
             # --- 3) 校验：文件必须出现在目标目录且大小一致
@@ -992,23 +1189,43 @@ def cmd_run(args):
             #     先用 find_recent 按更新时间倒序查前几页，再回退全目录 find_file。
             progress.stage_sync(bvid, 'verify', 0.0)
             found = None
+            local_name = os.path.basename(path)
             waits = FAKE_VERIFY_WAITS if fake_up else (2, 3, 5, 8, 12, 20)
             for i, wait in enumerate(waits):
                 time.sleep(wait)
-                found = q.find_recent(fid, os.path.basename(path), pages=2)
+                found = q.find_recent(fid, local_name, pages=2)
                 if found:
                     break
+                # 等到第 3 轮还没出现：数据其实早传完了，问题多半出在收尾没落盘。
+                # 重新提交一次收尾只要两个 API 调用，成功能省下重传几百 MB。
+                if i == 2 and fake_up is None:
+                    q.recommit(res.get('task_id'), res.get('obj_key'),
+                               log=lambda m: log('%s %s' % (tag, m)))
                 # 等待目录索引同步是有进度的（等第几轮），上报给面板免得看着像卡死
                 progress.item(bvid, 'verify', (i + 1) * 100.0 / len(waits),
                               detail='等待目录同步 %d/%d' % (i + 1, len(waits)))
                 log('%s 目录尚未同步，%ss 后重试…' % (tag, wait))
             if not found:
-                found = q.find_file(fid, os.path.basename(path))
+                # 兜底：全目录查找。顺带用 BV 号做子串匹配 —— 夸克遇到同名文件
+                # 可能自动改名（存成 xxx(1).mp4），只认精确名会误判成「找不到」。
+                found, loose = q.find_file_ex(fid, local_name, bvid=bvid)
+                if not found and loose:
+                    log('%s 精确名未命中，但目录里有同 BV 的 %d 个文件：%s'
+                        % (tag, len(loose),
+                           '、'.join((x.get('file_name') or '')[:60] for x in loose[:3])))
+                    if len(loose) == 1:
+                        found = loose[0]
             if not found:
-                raise QuarkError('上传后目标目录找不到该文件（已重试 50s + 全目录查找）')
+                raise QuarkError(
+                    '上传后目标目录找不到该文件（已重试 50s + 全目录查找）；'
+                    'task_id=%s bucket=%s obj_key=%s 收尾任务=%s/status=%s'
+                    % (str(res.get('task_id'))[:12], res.get('bucket'),
+                       str(res.get('obj_key'))[:16],
+                       str(res.get('finish_task'))[:12], res.get('finish_status')))
             if int(found.get('size') or 0) != rec['bytes']:
-                raise QuarkError('大小不一致 远端=%s 本地=%s'
-                                 % (found.get('size'), rec['bytes']))
+                raise QuarkError('大小不一致 远端=%s 本地=%s（远端文件名 %s）'
+                                 % (found.get('size'), rec['bytes'],
+                                    found.get('file_name') or ''))
             rec['remote_fid'] = found.get('fid')
             rec['status'] = 'uploaded'
             log('%s 已上传并校验通过 %s (远端 %d 字节)' % (tag, bvid, rec['bytes']))
@@ -1550,6 +1767,13 @@ def build_parser(with_top=True):
                    help='UP 主 mid（也可以写在子命令之前）；必填')
     p.add_argument('--season-id', default=None,
                    help='只抓该合集内的视频（来自 seasons 命令的 season_id）；不给则抓全部投稿')
+    p.add_argument('--limit', type=int, default=None, metavar='N',
+                   help='本次最多探测 N 条（分批抓取用）：投稿多的 UP 一次抓完会超过宿主超时，'
+                        '上层可反复调用直到结果里的 pending 变成 0')
+    p.add_argument('--refresh', action='store_true',
+                   help='重新拉取投稿列表（忽略 workdir 里的枚举缓存），并重新检查此前被剔除的条目')
+    p.add_argument('--probe-concurrency', type=int, default=4, metavar='K',
+                   help='探测并发数（默认 4；调太高容易被 B 站风控 412）')
     p.add_argument('--include-horizontal', action='store_true',
                    help='清单本身就包含全部条目（含横屏），此参数仅为显式说明')
     p.add_argument('--json', action='store_true', help='结果 JSON 打到 stdout')

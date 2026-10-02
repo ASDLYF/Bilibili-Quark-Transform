@@ -86,6 +86,8 @@ window.__ModuleLoader__.load({
       seasonCancel: '取消',
       seasonLoading: '正在读取该 UP 主的合集列表…',
       seasonSwitch: '换合集',
+      refetchList: '重新抓取清单',
+      refetchTitle: '重新抓取当前 UP 主的清单（会重新探测每条的分辨率）。给该 UP 充过电之后点一次，之前被剔除的充电视频就会被捡回来。',
       checkSrc: '与B站核对',
       credCheck: '检测有效性',
       credChecking: '正在检测…',
@@ -582,15 +584,17 @@ window.__ModuleLoader__.load({
       };
 
       /** 真正发起抓取；seasonId 为 0/空 表示抓全部投稿。 */
-      const runAddUp = async (m, seasonId) => {
+      const runAddUp = async (m, seasonId, force) => {
         setSeasonPick(null);
         setSeasonBusy(true);
         setAddMsg(seasonId
           ? '正在抓取该合集（不下载视频，约需 1～3 分钟，请等这一步返回）…'
-          : '正在抓取投稿清单（不下载视频，约需 1～3 分钟，请等这一步返回）…');
+          : (force
+              ? '正在重新抓取投稿清单，会重新探测每条分辨率（不下载视频，请等这一步返回）…'
+              : '正在抓取投稿清单（不下载视频；投稿多的 UP 会自动分批，请等这一步返回）…'));
         let r = null;
         try {
-          r = await act('addUp', { mid: m, seasonId: seasonId || undefined });
+          r = await act('addUp', { mid: m, seasonId: seasonId || undefined, force: force || undefined });
         } finally {
           setSeasonBusy(false);
         }
@@ -599,13 +603,30 @@ window.__ModuleLoader__.load({
           setSelMid(added);
           setNewMid('');
           // 不自动收起：这条两步引导要留在屏幕上才看得见
-          setAddMsg('已添加 UP 主 ' + added + '。下一步：在下方「夸克目标目录」里填目录路径，再点「保存目录」。');
+          const locked = Number((r.data && r.data.locked) || 0);
+          const pending = Number((r.data && r.data.pending) || 0);
+          setAddMsg(
+            '已添加 UP 主 ' + added + '。' +
+            (locked ? '已自动剔除 ' + locked + ' 条下载不了的（充电专属等），未计入清单。' : '') +
+            (pending
+              ? '这个 UP 主投稿很多，还有 ' + pending +
+                ' 条没探测完 —— 再点一次「重新抓取清单」会接着抓，已经抓好的不会重跑。'
+              : '下一步：在下方「夸克目标目录」里填目录路径，再点「保存目录」。'),
+          );
         } else {
           setAddMsg('失败：' + String((r && r.error) || '未知错误').slice(0, 300));
         }
         await reload();
         // 抓取结束（无论成败）都重新拉一次清单，避免列表停在"还没有投稿清单"的旧状态
         await loadVideos();
+      };
+
+      /** 重新抓取当前 UP 主的清单（force，忽略"清单已存在就不重抓"）。
+       *  用途：给该 UP 充过电之后，把之前被剔除的充电视频捡回来。 */
+      const refetchList = async () => {
+        const m = (active && active.mid) || selMid;
+        if (!m) return;
+        await runAddUp(m, 0, true);
       };
 
       const children = [];
@@ -911,6 +932,11 @@ window.__ModuleLoader__.load({
           // 换合集：直接回弹合集选择浮层（复用已选 UP 主的 mid，不必重新填 UID）
           active && vids && vids.seasonName
             ? button(T.seasonSwitch, () => askSeasonsThenFetch((active && active.mid) || selMid))
+            : null,
+          // 重新抓取清单：给该 UP 充过电之后，用它把之前被剔除的充电视频捡回来
+          active
+            ? button(T.refetchList, refetchList,
+                Object.assign({ title: T.refetchTitle }, seasonBusy ? { opacity: 0.6 } : null))
             : null,
           // 处理勾选的视频（横竖屏一视同仁）；没勾选时禁用
           active

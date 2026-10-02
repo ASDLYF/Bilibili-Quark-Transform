@@ -293,6 +293,28 @@ class Quark:
                     return it
         return None
 
+    def find_file_ex(self, pdir_fid, name, bvid=''):
+        """一次遍历同时找「精确同名」与「文件名里含 [BV号]」的条目。
+
+        夸克遇到同名文件可能自动改名（加 ``(1)`` 之类后缀），只按精确名找就会
+        误判成「上传后找不到该文件」。文件名里带着 ``[BV1xxx]``，所以再用 BV 号
+        做一次子串匹配兜住这种情况 —— 也顺便让「到底存成了什么名字」可见。
+
+        :return: ``(exact, loose)``；exact 为精确命中的条目或 None，
+                 loose 为所有含该 BV 号的条目列表。
+        """
+        loose = []
+        tag = '[%s]' % bvid if bvid else ''
+        for it in self.list_all(pdir_fid, size=100, sub_dirs=0):
+            if it.get('dir'):
+                continue
+            fn = it.get('file_name') or ''
+            if fn == name:
+                return it, loose
+            if tag and tag in fn:
+                loose.append(it)
+        return None, loose
+
     # --- 删除
     def delete(self, fids, log=None):
         """删除一个或多个文件/文件夹（移入回收站）。
@@ -389,7 +411,40 @@ class Quark:
 
         fin = self._ok(self.api('POST', '/1/clouddrive/file/upload/finish',
                                 payload={'task_id': task_id, 'obj_key': obj_key}))
-        return {'task_id': task_id, 'finish': fin, 'name': name, 'size': size}
+        # finish 是**异步**提交：数据传完 ≠ 文件已落盘，真正决定结果的是它返回的
+        # 收尾任务。原实现把返回值丢掉，于是一旦收尾任务失败，现象就只剩
+        # 「上传后目标目录找不到该文件」，完全看不出原因。这里把任务状态问出来，
+        # 并原样带回给上层做诊断与重试。
+        ftask = ''
+        if isinstance(fin, dict):
+            ftask = str((fin.get('data') or {}).get('task_id') or '')
+        fstatus = None
+        if ftask:
+            try:
+                fstatus = self.wait_task(ftask, timeout=30, interval=0.5, log=log)
+            except Exception as e:
+                log('    查询收尾任务失败（忽略）：%s' % e)
+        if fstatus == 3:
+            log('    警告：收尾任务失败 status=3 task_id=%s…' % ftask[:12])
+        return {'task_id': task_id, 'finish': fin, 'name': name, 'size': size,
+                'bucket': bucket, 'obj_key': obj_key,
+                'finish_task': ftask, 'finish_status': fstatus}
+
+    def recommit(self, task_id, obj_key, log=None):
+        """重新提交一次收尾（文件已传完、目录里却没出现时的低成本补救）。
+
+        数据早就在 OSS 上了，收尾只是两个 API 调用；重传整份文件要几百 MB 和
+        好几分钟，所以校验失败先试这个。失败不抛异常，交给上层继续等/报错。
+        """
+        if log:
+            log('    重新提交收尾 task_id=%s…' % str(task_id)[:12])
+        try:
+            return self._ok(self.api('POST', '/1/clouddrive/file/upload/finish',
+                                     payload={'task_id': task_id, 'obj_key': obj_key}))
+        except Exception as e:
+            if log:
+                log('    重新提交收尾失败：%s' % e)
+            return None
 
     # --- OSS 交互
     def _auth_meta_put(self, mime, oss_date, bucket, obj_key, upload_id, part, hash_ctx=''):

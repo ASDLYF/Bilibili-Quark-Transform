@@ -632,14 +632,38 @@ export function registerPanelRoutes(ctx, deps) {
           const listPath = root ? join(root, String(mid), 'video_list.json') : '';
           const steps = [];
           const seasonId = body.seasonId ? Number(body.seasonId) : undefined;
-          // 指定了合集就一定重抓（用户是明确来换合集的），否则沿用"清单已有就不重抓"
-          if (seasonId || !existsSync(listPath)) {
-            const fetched = await callTool('bili_quark_fetch', { mid, seasonId });
-            steps.push({ step: 'fetch', ok: fetched.ok !== false, error: fetched.error || '' });
+          // fetch 会剔掉充电专属/大会员专享这类根本下不了的条目，数量回传给前端做提示。
+          // 若沿用已有清单（不重抓），就从清单里把它读回来，别让提示凭空消失。
+          let locked = 0;
+          // 大 UP 的清单要分多批探测（见 index.js 的 FETCH_CHUNK），pending>0 说明
+          // 这一趟没抓完，前端要提示用户再点一次「重新抓取清单」接着抓。
+          let pending = 0;
+          // force：用户明确要重抓（典型场景是刚给该 UP 充了电，想把充电专属视频捡回来）
+          const force = Boolean(body.force);
+          // 指定了合集就一定重抓（用户是明确来换合集的），force 同理，
+          // 否则沿用"清单已有就不重抓"
+          if (seasonId || force || !existsSync(listPath)) {
+            const fetched = await callTool('bili_quark_fetch', {
+              mid,
+              seasonId,
+              refresh: force || undefined,
+            });
+            locked = Number(fetched.locked || 0);
+            pending = Number(fetched.pending || 0);
+            steps.push({
+              step: 'fetch',
+              ok: fetched.ok !== false,
+              error: fetched.error || '',
+              pending,
+            });
             if (fetched.ok === false) {
               result = { ok: false, error: `抓取投稿清单失败：${fetched.error}`, steps };
               break;
             }
+          } else {
+            const cached = readJson(listPath);
+            locked = Number((cached && cached.locked) || 0);
+            pending = Number((cached && cached.pending) || 0);
           }
           const dirPath = body.path ? String(body.path) : '';
           if (dirPath) {
@@ -649,10 +673,10 @@ export function registerPanelRoutes(ctx, deps) {
               result = { ok: false, error: `解析目标目录失败：${resolved.error}`, steps };
               break;
             }
-            result = { ok: true, mid, dirName: resolved.name || '', fid: resolved.fid || '', steps };
+            result = { ok: true, mid, dirName: resolved.name || '', fid: resolved.fid || '', locked, pending, steps };
           } else {
             // 正常路径：清单已（或已存在）就绪，目标目录留给面板的目录卡片设置
-            result = { ok: true, mid, dirName: '', fid: '', steps };
+            result = { ok: true, mid, dirName: '', fid: '', locked, pending, steps };
           }
           break;
         }

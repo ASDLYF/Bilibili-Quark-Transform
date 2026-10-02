@@ -502,6 +502,11 @@ export function apply(ctx, config = {}) {
   };
 
   // ============================================================ fetch
+  // 抓取分批参数：大 UP（几千条投稿）一次抓完会超过 backendTimeoutMs
+  // （默认 20 分钟）被宿主整个杀掉，所以按批探测、进度落盘。
+  const FETCH_CHUNK = 150; // 每批最多探测多少条（并发 4 时约 1 分钟一批）
+  const FETCH_BUDGET_MS = 12 * 60 * 1000; // 单次工具调用最多循环多久，留足余量
+
   define({
     name: 'bili_quark_fetch',
     description:
@@ -514,6 +519,12 @@ export function apply(ctx, config = {}) {
         seasonId: {
           type: 'number',
           description: '只抓指定合集内的视频（来自 bili_quark_seasons 的 seasonId）；不传则抓全部投稿',
+        },
+        refresh: {
+          type: 'boolean',
+          description:
+            '重新拉取投稿列表（忽略已缓存的枚举），并重新检查此前被剔除的条目。' +
+            '给某个 UP 充过电之后用它，可以把之前下不了的充电视频捡回来',
         },
         includeHorizontal: { type: 'boolean', description: '是否也包含横屏视频（默认 false，只保留竖屏）' },
       },
@@ -529,6 +540,23 @@ export function apply(ctx, config = {}) {
           vertical: { type: 'number' },
           horizontal: { type: 'number' },
           unknown: { type: 'number' },
+          enumTotal: { type: 'number' },
+          pending: { type: 'number' },
+          processed: { type: 'number' },
+          rounds: { type: 'number' },
+          truncated: { type: 'boolean' },
+          locked: { type: 'number' },
+          lockedItems: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                bvid: { type: 'string' },
+                title: { type: 'string' },
+                reason: { type: 'string' },
+              },
+            },
+          },
           seasonId: { type: 'number' },
           seasonName: { type: 'string' },
           workDir: { type: 'string' },
@@ -540,15 +568,30 @@ export function apply(ctx, config = {}) {
       },
       render(_a, v) {
         if (!v.ok) return block(`抓取失败：${v.error}`);
-        return block(
-          [
-            `UP 主 ${v.mid} ${v.seasonName ? `合集「${v.seasonName}」` : '投稿'}抓取完成`,
-            `  总投稿 ${v.total} 条 → 竖屏 ${v.vertical} / 横屏 ${v.horizontal} / 未知 ${v.unknown}`,
-            `  清单：${v.videoList}`,
-            '',
-            '下一步：bili_quark_targets 看体积估算与磁盘检查。',
-          ].join('\n'),
-        );
+        const lockedItems = v.lockedItems || [];
+        const lockedLines = v.locked
+          ? [
+              `  已剔除 ${v.locked} 条下不了的（充电专属 / 大会员专享 / 地区受限），未写入清单：`,
+              ...lockedItems.slice(0, 5).map((x) => `    - ${x.bvid} ${x.title || ''}`),
+              ...(lockedItems.length > 5 ? [`    …… 另有 ${lockedItems.length - 5} 条`] : []),
+            ]
+          : [];
+        const pendingLines = v.pending
+          ? [
+              `  ⚠ 还有 ${v.pending} 条没探测完（本次 ${v.rounds || 1} 批，共探测 ${v.processed || 0} 条）` +
+                (v.truncated ? '，时间到了先停' : ''),
+              '    再执行一次 bili_quark_fetch 会接着抓，已经抓好的不会重跑。',
+            ]
+          : [];
+        const lines = [
+          `UP 主 ${v.mid} ${v.seasonName ? `合集「${v.seasonName}」` : '投稿'}抓取${v.pending ? '未完成' : '完成'}`,
+          `  枚举 ${v.enumTotal || v.total} 条 → 已探测 ${v.total} 条：竖屏 ${v.vertical} / 横屏 ${v.horizontal} / 未知 ${v.unknown}`,
+          ...lockedLines,
+          ...pendingLines,
+          `  清单：${v.videoList}`,
+        ];
+        if (!v.pending) lines.push('', '下一步：bili_quark_targets 看体积估算与磁盘检查。');
+        return block(lines.join('\n'));
       },
     },
     isConcurrencySafe: () => false,
@@ -558,29 +601,64 @@ export function apply(ctx, config = {}) {
       const dir = assertBackend(cfg);
       const work = workDirFor(cfg, mid);
       const listPath = join(work, 'video_list.json');
-      const cliArgs = ['-m', 'bili_quark.cli', 'fetch', ...backendBase(cfg, mid, work)];
       const seasonId = args?.seasonId ? String(args.seasonId) : '';
-      if (seasonId) cliArgs.push('--season-id', seasonId);
-      if (args?.includeHorizontal) cliArgs.push('--include-horizontal');
+      const env = cookieEnv(cfg, args?.biliCookie, args?.quarkCookie);
 
-      const r = await runPythonJson(cfg, dir, cliArgs, {
-        work,
-        env: cookieEnv(cfg, args?.biliCookie, args?.quarkCookie),
-      });
-      if (!r.ok) {
-        const list = readJson(listPath);
-        if (!list) {
-          return {
-            ok: false,
-            mid,
-            workDir: work,
-            command: r.command,
-            error: `${r.error}\n${r.log || ''}`.trim(),
-          };
+      // 大 UP 动辄几千条投稿，逐条 playurl 探测要几十分钟，会撞上 backendTimeoutMs
+      // （默认 20 分钟）被宿主整个杀掉、前功尽弃。所以分成多批跑：每批最多探测
+      // FETCH_CHUNK 条，进度落在 video_list.json / video_raw.json 里，下一批接着抓。
+      const t0 = Date.now();
+      let command = '';
+      let list = null;
+      let rounds = 0;
+      let processed = 0;
+      let truncated = false;
+      for (;;) {
+        const cliArgs = ['-m', 'bili_quark.cli', 'fetch', ...backendBase(cfg, mid, work)];
+        if (seasonId) cliArgs.push('--season-id', seasonId);
+        if (args?.includeHorizontal) cliArgs.push('--include-horizontal');
+        cliArgs.push('--limit', String(FETCH_CHUNK));
+        // 只让第一批 --refresh：重新拉列表 + 重查被剔除的条目，后面几批接着抓就行
+        if (rounds === 0 && args?.refresh) cliArgs.push('--refresh');
+
+        const r = await runPythonJson(cfg, dir, cliArgs, { work, env });
+        command = r.command || command;
+        if (!r.ok) {
+          const fallback = readJson(listPath);
+          if (!fallback) {
+            return {
+              ok: false,
+              mid,
+              workDir: work,
+              command,
+              error: `${r.error}\n${r.log || ''}`.trim(),
+            };
+          }
+          // 这一批失败了，但磁盘上已经有抓好的清单：拿它继续，别把整个抓取判死
+          list = fallback;
+          truncated = true;
+          break;
+        }
+        list = r.value || {};
+        rounds += 1;
+        const batch = Number(list.processed || 0);
+        processed += batch;
+        if (!Number(list.pending || 0)) break;
+        // 一批下来一条都没探测成功（多半是被风控了），再循环也是白跑
+        if (!batch) {
+          truncated = true;
+          break;
+        }
+        if (Date.now() - t0 > FETCH_BUDGET_MS) {
+          truncated = true;
+          break;
         }
       }
-      const list = r.ok ? r.value : readJson(listPath);
+
       const items = list.items || [];
+      const lockedItems = list.locked_items || [];
+      const locked = typeof list.locked === 'number' ? list.locked : lockedItems.length;
+      const pending = Number(list.pending || 0);
       return {
         ok: true,
         mid,
@@ -588,11 +666,18 @@ export function apply(ctx, config = {}) {
         vertical: items.filter((x) => x.vertical === true).length,
         horizontal: items.filter((x) => x.vertical === false).length,
         unknown: items.filter((x) => x.vertical === null || x.vertical === undefined).length,
+        enumTotal: Number(list.enum_total || items.length),
+        pending,
+        processed,
+        rounds,
+        truncated: truncated || undefined,
+        locked,
+        lockedItems,
         seasonId: list.season_id ? Number(list.season_id) : undefined,
         seasonName: list.season_name || undefined,
         workDir: work,
         videoList: listPath,
-        command: r.command,
+        command,
       };
     },
     presentCall: (a) => ({

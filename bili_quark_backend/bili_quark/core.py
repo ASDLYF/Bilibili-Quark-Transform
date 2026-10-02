@@ -132,6 +132,11 @@ def classify(items, vertical_only=True, include_horizontal=()):
     inc = set(include_horizontal or ())
     ver, hor, unk = [], [], []
     for x in items:
+        # 探测阶段已判定"接口回了但没有可用流"的（充电专属/大会员专享等），
+        # 正常路径下根本不会写进清单；这里只是兜底 —— 老清单或手改的清单里
+        # 若混进了这种条目，绝不能拿它当下载目标。
+        if x.get('lock'):
+            continue
         if x.get('bvid') in inc:
             hor.append(x)                 # 显式包含的横屏，按横屏归类
         elif x.get('vertical') is True:

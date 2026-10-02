@@ -7,6 +7,10 @@ import hashlib
 import os
 import random
 import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import http_util  # noqa: E402  （走直连 opener，绕开系统代理）
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -65,7 +69,7 @@ class Bili:
         for attempt in range(retries):
             req = urllib.request.Request(url, headers=headers)
             try:
-                body = urllib.request.urlopen(req, timeout=30).read()
+                body = http_util.opener().open(req, timeout=30).read()
                 return body if raw else json.loads(body)
             except urllib.error.HTTPError as e:
                 last = e
@@ -185,6 +189,9 @@ class Bili:
             'width': w, 'height': h,
             'duration': data.get('timelength', 0) // 1000 or dim.get('rotate'),
             'accept': data.get('accept_description'),
+            # dash 档数。充电专属/大会员专享/地区受限的视频 code=0、message=OK，
+            # 但 video 列表是空的 —— 光看 code 判断不出「能不能下」。
+            'streams': len(data.get('dash', {}).get('video') or []),
         }
 
 

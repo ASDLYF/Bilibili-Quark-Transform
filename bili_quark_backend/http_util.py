@@ -4,12 +4,41 @@
 所以全部网络请求都走这里，不依赖 requests。
 """
 import json
+import os
 import ssl
 import time
 import urllib.request
 import urllib.error
 
 _CTX = ssl.create_default_context()
+
+_OPENER = None
+
+
+def opener():
+    """全局复用的 urllib opener，**不走系统代理**。
+
+    macOS 上 urllib 默认会读系统代理（``getproxies()``）。本机 Clash 的
+    127.0.0.1:7897 是给 GitHub 用的，实测它让 B 站 API 慢 6~7 倍
+    （TLS 握手 0.11s → 0.75s），下载视频流时还会间歇性抛
+    ``_ssl.c:1112: The handshake operation timed out``。
+    所以国内站点（B 站 / 夸克）一律直连；确实需要走代理时设
+    环境变量 ``BILI_QUARK_PROXY_MODE=1``。
+
+    注意变量名**不能以 _PROXY 结尾**：``getproxies_environment()`` 会把任何
+    以 ``_proxy`` 结尾的环境变量当成代理配置（实测 ``BILI_QUARK_USE_PROXY=1``
+    会让 ``getproxies()`` 变成 ``{'bili_quark_use': '1'}``，反而把真正的
+    系统代理配置挤掉）。
+    """
+    global _OPENER
+    if _OPENER is None:
+        if os.environ.get('BILI_QUARK_PROXY_MODE') == '1':
+            h = urllib.request.ProxyHandler()
+        else:
+            h = urllib.request.ProxyHandler({})
+        _OPENER = urllib.request.build_opener(
+            h, urllib.request.HTTPSHandler(context=_CTX))
+    return _OPENER
 
 DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36")
@@ -67,7 +96,7 @@ def request(method, url, headers=None, data=None, timeout=60,
     for attempt in range(retries + 1):
         req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=timeout, context=_CTX) as r:
+            with opener().open(req, timeout=timeout) as r:
                 return Resp(r.status, dict(r.headers), r.read())
         except urllib.error.HTTPError as e:
             raw = e.read()

@@ -70,6 +70,10 @@ def targets():
     for x in items:
         if x['bvid'] in SKIP_BVID:
             continue
+        # 充电专属/大会员专享这类"接口回了但没有可用流"的条目绝不能当目标。
+        # 正常路径下 cli.py 的 fetch 已经把它们剔出清单，这里是兜底。
+        if x.get('lock'):
+            continue
         if x['vertical'] or x['bvid'] in INCLUDE_HORIZONTAL:
             out.append(x)
     return out
@@ -225,19 +229,38 @@ def cmd_run(only=None, workers=5, keep=False, part_concurrency=8):
             # 上传后校验：文件必须出现在目标目录且大小一致。
             # 夸克目录列表有索引延迟，用「更新时间倒序的前几页」快速查找并重试。
             found = None
-            for wait in (2, 3, 5, 8, 12, 20):
+            local_name = os.path.basename(path)
+            for i, wait in enumerate((2, 3, 5, 8, 12, 20)):
                 time.sleep(wait)
-                found = q.find_recent(fid, os.path.basename(path), pages=2)
+                found = q.find_recent(fid, local_name, pages=2)
                 if found:
                     break
+                # 第 3 轮还没出现：数据早传完了，多半是收尾没落盘。重提一次收尾
+                # 只要两个 API 调用，成功能省下重传整份文件。
+                if i == 2:
+                    q.recommit(res.get('task_id'), res.get('obj_key'),
+                               log=lambda m: log('%s %s' % (tag, m)))
                 log('%s 目录尚未同步，%ds 后重试…' % (tag, wait))
             if not found:
-                # 兜底：慢速全目录查找
-                found = q.find_file(fid, os.path.basename(path))
+                # 兜底：全目录查找，并用 BV 号做子串匹配（夸克遇同名可能自动改名）
+                found, loose = q.find_file_ex(fid, local_name, bvid=bvid)
+                if not found and loose:
+                    log('%s 精确名未命中，但目录里有同 BV 的 %d 个文件：%s'
+                        % (tag, len(loose),
+                           '、'.join((x.get('file_name') or '')[:60] for x in loose[:3])))
+                    if len(loose) == 1:
+                        found = loose[0]
             if not found:
-                raise QuarkError('上传后目标目录找不到该文件（已重试 50s + 全目录查找）')
+                raise QuarkError(
+                    '上传后目标目录找不到该文件（已重试 50s + 全目录查找）；'
+                    'task_id=%s bucket=%s obj_key=%s 收尾任务=%s/status=%s'
+                    % (str(res.get('task_id'))[:12], res.get('bucket'),
+                       str(res.get('obj_key'))[:16],
+                       str(res.get('finish_task'))[:12], res.get('finish_status')))
             if int(found.get('size') or 0) != size:
-                raise QuarkError('大小不一致 远端=%s 本地=%s' % (found.get('size'), size))
+                raise QuarkError('大小不一致 远端=%s 本地=%s（远端文件名 %s）'
+                                 % (found.get('size'), size,
+                                    found.get('file_name') or ''))
             rec['remote_fid'] = found.get('fid')
             rec['status'] = 'uploaded'
             log('%s 已上传并校验通过 %s (远端 %d 字节)' % (tag, bvid, size))
